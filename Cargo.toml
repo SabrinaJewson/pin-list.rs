@@ -1,0 +1,23 @@
+[package]
+name = "wait-list"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56.0"
+description = "The most fundamental primitive for async synchronization"
+repository = "https://github.com/SabrinaJewson/wait-list.rs"
+license = "MIT"
+keywords = ["WaitList", "Notify", "event-listener"]
+categories = ["asynchronous", "concurrency", "data-structures", "no-std"]
+
+[dependencies]
+lock_api_04_crate = { package = "lock_api", version = "0.4.7", optional = true }
+pinned-aliasable = "0.1.2"
+pin-project-lite = "0.2.9"
+
+[features]
+alloc = []
+std = ["alloc"]
+lock_api_04 = ["lock_api_04_crate"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "doc_nightly"]
