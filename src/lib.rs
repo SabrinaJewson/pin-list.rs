@@ -227,6 +227,64 @@ enum WaiterState<I, O> {
     },
 }
 
+impl<I, O> Inner<I, O> {
+    /// Add a waiter node to the end of this linked list.
+    ///
+    /// # Safety
+    ///
+    /// - `waiter` must be the only reference to that object.
+    /// - `waiter` must be a valid pointer until it is removed.
+    unsafe fn enqueue(&mut self, waiter: &UnsafeCell<Waiter<I, O>>) {
+        // Set the previous waiter to the current tail of the queue, if there was one.
+        unsafe { &mut *waiter.get() }.prev = self.tail;
+
+        let waiter_ptr = NonNull::from(waiter);
+
+        // Update the old tail's next pointer
+        if let Some(prev) = self.tail {
+            let prev = unsafe { &mut *prev.as_ref().get() };
+            debug_assert_eq!(prev.next, None);
+            prev.next = Some(waiter_ptr);
+        }
+
+        // Set the waiter as the new tail of the linked list
+        self.tail = Some(waiter_ptr);
+
+        // Also set it as the head if there isn't currently a head.
+        self.head.get_or_insert(waiter_ptr);
+    }
+
+    /// Remove a waiter node from an arbitrary position in the linked list.
+    ///
+    /// # Safety
+    ///
+    /// - `waiter` must be a waiter in this queue.
+    /// - No other unique references to `waiter` may exist.
+    unsafe fn dequeue(&mut self, waiter: &UnsafeCell<Waiter<I, O>>) {
+        let waiter_ptr = Some(NonNull::from(waiter));
+        let waiter = unsafe { &mut *waiter.get() };
+
+        let prev = waiter.prev;
+        let next = waiter.next;
+
+        // Update the pointer of the previous node, or the queue head
+        let prev_next_pointer = match waiter.prev {
+            Some(prev) => &mut unsafe { &mut *prev.as_ref().get() }.next,
+            None => &mut self.head,
+        };
+        debug_assert_eq!(*prev_next_pointer, waiter_ptr);
+        *prev_next_pointer = next;
+
+        // Update the pointer of the next node, or the queue tail
+        let next_prev_pointer = match waiter.next {
+            Some(next) => &mut unsafe { &mut *next.as_ref().get() }.prev,
+            None => &mut self.tail,
+        };
+        debug_assert_eq!(*next_prev_pointer, waiter_ptr);
+        *next_prev_pointer = prev;
+    }
+}
+
 impl<L, I, O> WaitList<L, I, O>
 where
     // workaround for no trait bounds in `const fn`
@@ -360,34 +418,6 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
         self.wait(input, on_cancel)
     }
 
-    /// Add a waiter node to the end of this linked list.
-    ///
-    /// # Safety
-    ///
-    /// - `waiter` must be the only reference to that object.
-    /// - `waiter` must be a valid pointer until it is removed.
-    unsafe fn enqueue(&mut self, waiter: &UnsafeCell<Waiter<I, O>>) {
-        let inner = self.inner_mut();
-
-        // Set the previous waiter to the current tail of the queue, if there was one.
-        unsafe { &mut *waiter.get() }.prev = inner.tail;
-
-        let waiter_ptr = NonNull::from(waiter);
-
-        // Update the old tail's next pointer
-        if let Some(prev) = inner.tail {
-            let prev = unsafe { &mut *prev.as_ref().get() };
-            debug_assert_eq!(prev.next, None);
-            prev.next = Some(waiter_ptr);
-        }
-
-        // Set the waiter as the new tail of the linked list
-        inner.tail = Some(waiter_ptr);
-
-        // Also set it as the head if there isn't currently a head.
-        inner.head.get_or_insert(waiter_ptr);
-    }
-
     /// Wake and dequeue the first waiter in the queue, if there is one.
     ///
     /// Returns ownership of that waiter's input value.
@@ -417,42 +447,12 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
         let head = unsafe { NonNull::from(head).as_ref() };
 
         // Dequeue the first waiter now that it's not necessary to keep it in the queue.
-        unsafe { self.dequeue(head) };
+        unsafe { self.inner_mut().dequeue(head) };
 
         // Wake the waker last, to ensure that if this panics nothing goes wrong.
         waker.wake();
 
         Ok(input)
-    }
-
-    /// Remove a waiter node from an arbitrary position in the linked list.
-    ///
-    /// # Safety
-    ///
-    /// - `waiter` must be a waiter in this queue.
-    /// - No other unique references to `waiter` may exist.
-    unsafe fn dequeue(&mut self, waiter: &UnsafeCell<Waiter<I, O>>) {
-        let waiter_ptr = Some(NonNull::from(waiter));
-        let waiter = unsafe { &mut *waiter.get() };
-
-        let prev = waiter.prev;
-        let next = waiter.next;
-
-        // Update the pointer of the previous node, or the queue head
-        let prev_next_pointer = match waiter.prev {
-            Some(prev) => &mut unsafe { &mut *prev.as_ref().get() }.next,
-            None => &mut self.inner_mut().head,
-        };
-        debug_assert_eq!(*prev_next_pointer, waiter_ptr);
-        *prev_next_pointer = next;
-
-        // Update the pointer of the next node, or the queue tail
-        let next_prev_pointer = match waiter.next {
-            Some(next) => &mut unsafe { &mut *next.as_ref().get() }.prev,
-            None => &mut self.inner_mut().tail,
-        };
-        debug_assert_eq!(*next_prev_pointer, waiter_ptr);
-        *next_prev_pointer = prev;
     }
 }
 
@@ -673,7 +673,7 @@ where
                     WaitStateProject::Waiting { waiter, .. } => waiter,
                     _ => unreachable!(),
                 };
-                unsafe { guard.enqueue(waiter.as_ref().get()) };
+                unsafe { guard.inner_mut().enqueue(waiter.as_ref().get()) };
 
                 // Pend, since we've cloned the waker and added it in the list already
                 Poll::Pending
@@ -742,7 +742,7 @@ where
                 if let WaiterState::Waiting { .. } = unsafe { &(*waiter.get()).state } {
                     // Dequeue ourselves so we can safely drop everything while no-one references
                     // it.
-                    unsafe { list.dequeue(waiter) };
+                    unsafe { list.inner_mut().dequeue(waiter) };
                 }
 
                 // Disarm the guard, we no longer need to abort on a panic.
