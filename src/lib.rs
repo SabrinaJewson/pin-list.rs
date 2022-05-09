@@ -413,28 +413,27 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
     ///
     /// Returns an error and gives back the given output when there are no wakers in the list.
     pub fn wake_one(&mut self, output: O) -> Result<I, O> {
-        let head = match self.head() {
+        let head = match self.inner_mut().head {
             Some(head) => head,
             None => return Err(output),
         };
 
-        let head_waiter = unsafe { &mut *head.get() };
+        let (input, waker) = {
+            // SAFETY: We hold an exclusive lock to the list.
+            let head_waiter = unsafe { &mut *head.as_ref().get() };
 
-        // Take the `Waker`, both for later waking and to mark it as woken
-        let new_state = WaiterState::Woken {
-            output: ManuallyDrop::new(output),
+            // Mark the head node's state as done.
+            let new_state = WaiterState::Woken {
+                output: ManuallyDrop::new(output),
+            };
+            match mem::replace(&mut head_waiter.state, new_state) {
+                WaiterState::Waiting { input, waker } => (input, waker),
+                WaiterState::Woken { .. } => unreachable!(),
+            }
         };
-        let (input, waker) = match mem::replace(&mut head_waiter.state, new_state) {
-            WaiterState::Waiting { input, waker } => (input, waker),
-            WaiterState::Woken { .. } => unreachable!(),
-        };
-
-        // Extend the lifetime of `head` so the `self` borrow below doesn't conflict with it.
-        // SAFETY: The safety contract of `enqueue` ensures the waiter lives long enough.
-        let head = unsafe { NonNull::from(head).as_ref() };
 
         // Dequeue the first waiter now that it's not necessary to keep it in the queue.
-        unsafe { self.inner_mut().dequeue(head) };
+        unsafe { self.inner_mut().dequeue(head.as_ref()) };
 
         // Wake the waker last, to ensure that if this panics nothing goes wrong.
         waker.wake();
