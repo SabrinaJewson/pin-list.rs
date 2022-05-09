@@ -544,6 +544,68 @@ where
     state: WaitState<'wait_list, L, I, O, OnCancel>,
 }
 
+#[allow(clippy::type_repetition_in_bounds)]
+unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for Wait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+
+    // - `L` is not required to be `Send` because we can't move or drop it with just our shared
+    // reference to it.
+    // - `L` is required to be `Sync` because we access it from a shared reference.
+    L: Sync,
+    // - `I` is required to be `Send` because we own it and will drop it if we are dropped.
+    // - `I` is not required to be `Sync` because we don't ever touch a shared reference to it post
+    // placing it in the linked list node; all access to it is done by the `WaitList` itself.
+    I: Send,
+    // - `O` is required to be `Send` because we can own an instance of it and give back ownership
+    // of that instance.
+    // - `O` is not required to be `Sync` because we never deal in `&O`.
+    O: Send,
+    // - `OnCancel` is required to be `Send` because we always own an instance of it.
+    // - `OnCancel` is not required to be `Sync` because we never deal in `&OnCancel`.
+    OnCancel: Send,
+{
+}
+
+impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+{
+    /// Manual pin-projection because I need `Drop` and don't want to bring in the full
+    /// `pin-project`.
+    fn project(self: Pin<&mut Self>) -> Pin<&mut WaitState<'wait_list, L, I, O, OnCancel>> {
+        let this = unsafe { Pin::into_inner_unchecked(self) };
+        unsafe { Pin::new_unchecked(&mut this.state) }
+    }
+}
+
+pin_project! {
+    /// The state of a `Wait` future.
+    #[project = WaitStateProject]
+    #[project_replace = WaitStateProjectReplace]
+    enum WaitState<'wait_list, L: Lock, I, O, OnCancel>
+    where
+        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    {
+        /// We have been polled at least once and, if we haven't been woken, are still a node in
+        /// the linked list.
+        Waiting {
+            // The list this future is a part of.
+            wait_list: &'wait_list WaitList<L, I, O>,
+
+            // The actual alised node in the `WaitList`'s linked list.
+            #[pin]
+            waiter: Aliasable<UnsafeCell<Waiter<I, O>>>,
+
+            // The callback to be called when the future has been woken but it is cancelled before
+            // it could return `Ready`.
+            on_cancel: OnCancel,
+        },
+        /// We are either finished or we haven't been initialized yet.
+        Done,
+    }
+}
+
 impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
@@ -628,68 +690,6 @@ where
         on_cancel: OnCancel,
     ) {
         self.init(noop_waker(), guard, input, on_cancel);
-    }
-}
-
-#[allow(clippy::type_repetition_in_bounds)]
-unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for Wait<'wait_list, L, I, O, OnCancel>
-where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-
-    // - `L` is not required to be `Send` because we can't move or drop it with just our shared
-    // reference to it.
-    // - `L` is required to be `Sync` because we access it from a shared reference.
-    L: Sync,
-    // - `I` is required to be `Send` because we own it and will drop it if we are dropped.
-    // - `I` is not required to be `Sync` because we don't ever touch a shared reference to it post
-    // placing it in the linked list node; all access to it is done by the `WaitList` itself.
-    I: Send,
-    // - `O` is required to be `Send` because we can own an instance of it and give back ownership
-    // of that instance.
-    // - `O` is not required to be `Sync` because we never deal in `&O`.
-    O: Send,
-    // - `OnCancel` is required to be `Send` because we always own an instance of it.
-    // - `OnCancel` is not required to be `Sync` because we never deal in `&OnCancel`.
-    OnCancel: Send,
-{
-}
-
-impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
-where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-{
-    /// Manual pin-projection because I need `Drop` and don't want to bring in the full
-    /// `pin-project`.
-    fn project(self: Pin<&mut Self>) -> Pin<&mut WaitState<'wait_list, L, I, O, OnCancel>> {
-        let this = unsafe { Pin::into_inner_unchecked(self) };
-        unsafe { Pin::new_unchecked(&mut this.state) }
-    }
-}
-
-pin_project! {
-    /// The state of a `Wait` future.
-    #[project = WaitStateProject]
-    #[project_replace = WaitStateProjectReplace]
-    enum WaitState<'wait_list, L: Lock, I, O, OnCancel>
-    where
-        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-    {
-        /// We have been polled at least once and, if we haven't been woken, are still a node in
-        /// the linked list.
-        Waiting {
-            // The list this future is a part of.
-            wait_list: &'wait_list WaitList<L, I, O>,
-
-            // The actual alised node in the `WaitList`'s linked list.
-            #[pin]
-            waiter: Aliasable<UnsafeCell<Waiter<I, O>>>,
-
-            // The callback to be called when the future has been woken but it is cancelled before
-            // it could return `Ready`.
-            on_cancel: OnCancel,
-        },
-        /// We are either finished or we haven't been initialized yet.
-        Done,
     }
 }
 
