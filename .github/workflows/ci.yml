@@ -1,0 +1,100 @@
+{
+    "name": "CI",
+    "on": ["push", "pull_request"],
+    "jobs": {
+        "build": {
+            "runs-on": "ubuntu-latest",
+            "steps": [
+                { "uses": "actions/checkout@v1" },
+                {
+                    "uses": "actions-rs/toolchain@v1",
+                    "with": {
+                        "toolchain": "stable",
+                        "override": true,
+                        "profile": "minimal"
+                    }
+                },
+                {
+                    "uses": "actions-rs/cargo@v1",
+                    "with": { "command": "build", "args": "--all-targets --all-features" }
+                }
+            ]
+        },
+        "build-msrv": {
+            "runs-on": "ubuntu-latest",
+            "steps": [
+                { "uses": "actions/checkout@v1" },
+                {
+                    "uses": "actions-rs/toolchain@v1",
+                    "with": {
+                        "toolchain": "1.56.0",
+                        "override": true,
+                        "profile": "minimal"
+                    }
+                },
+                {
+                    "uses": "actions-rs/cargo@v1",
+                    "with": { "command": "build", "args": "--all-targets --all-features" }
+                }
+            ]
+        },
+        "test": {
+            "runs-on": "ubuntu-latest",
+            "steps": [
+                { "uses": "actions/checkout@v1" },
+                {
+                    "uses": "actions-rs/toolchain@v1",
+                    "with": {
+                        "toolchain": "stable",
+                        "override": true,
+                        "profile": "minimal"
+                    }
+                },
+                {
+                    "uses": "actions-rs/cargo@v1",
+                    "with": { "command": "test", "args": "--all-features" }
+                }
+            ]
+        },
+        "miri": {
+            "runs-on": "ubuntu-latest",
+            "steps": [
+                { "uses": "actions/checkout@v1" },
+                {
+                    "uses": "actions-rs/toolchain@v1",
+                    "with": {
+                        "toolchain": "nightly",
+                        "override": true,
+                        "components": "miri"
+                    }
+                },
+                {
+                    "uses": "actions-rs/cargo@v1",
+                    "with": { "command": "miri", "args": "test --all-features" },
+                    "env": {
+                        "RUSTFLAGS": "-Zrandomize-layout",
+                        "MIRIFLAGS": "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+                    }
+                }
+            ]
+        },
+        "rustfmt": {
+            "runs-on": "ubuntu-latest",
+            "steps": [
+                { "uses": "actions/checkout@v1" },
+                {
+                    "uses": "actions-rs/toolchain@v1",
+                    "with": {
+                        "toolchain": "stable",
+                        "override": true,
+                        "components": "rustfmt"
+                    }
+                },
+                {
+                    "uses": "actions-rs/cargo@v1",
+                    "with": { "command": "fmt", "args": "--check" }
+                }
+            ]
+        }
+    }
+}
