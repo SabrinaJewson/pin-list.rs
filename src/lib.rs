@@ -51,7 +51,9 @@
 //!             future.as_mut().init_without_waker(
 //!                 &mut waiters,
 //!                 (),
-//!                 |mut list, ()| { let _ = list.wake_one(()); },
+//!                 |mut list: wait_list::LockedExclusive<'_, _, _, _>, ()| {
+//!                     let _ = list.wake_one(());
+//!                 },
 //!             );
 //!         }
 //!     }
@@ -394,7 +396,7 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
         on_cancel: OnCancel,
     ) -> InitAndWait<'wait_list, L, I, O, OnCancel>
     where
-        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+        OnCancel: CancelCallback<'wait_list, L, I, O>,
     {
         InitAndWait {
             input: Some(InitAndWaitInput {
@@ -540,7 +542,7 @@ impl<'wait_list, L: Lock + Debug, I, O> Debug for LockedCommon<'wait_list, L, I,
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Wait<'wait_list, L: Lock, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     inner: WaitInner<'wait_list, L, I, O, OnCancel>,
 }
@@ -576,7 +578,7 @@ where
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     /// Manual pin-projection because I need `Drop` and don't want to bring in the full
     /// `pin-project`.
@@ -614,7 +616,7 @@ pin_project! {
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     /// Create a new `Wait` future.
     ///
@@ -703,7 +705,7 @@ where
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Future for Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     type Output = (LockedExclusive<'wait_list, L, I, O>, O);
 
@@ -747,7 +749,7 @@ where
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Drop for Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     fn drop(&mut self) {
         // This is necessary for soundness since we were pinned before in our `poll` function
@@ -786,11 +788,11 @@ where
                 if let WaiterState::Woken { output } = unsafe { &mut (*waiter.get()).state } {
                     let output = unsafe { ManuallyDrop::take(output) };
 
-                    let on_cancel = match state.project_replace(WaitState::Done) {
+                    let cancel_callback = match state.project_replace(WaitState::Done) {
                         WaitStateProjectReplace::Waiting { on_cancel, .. } => on_cancel,
                         WaitStateProjectReplace::Done => unreachable!(),
                     };
-                    on_cancel(list, output);
+                    cancel_callback.on_cancel(list, output);
                 }
             }
             // No need to do anything if we didn't start to run or have completed.
@@ -801,7 +803,7 @@ where
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Default for Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     fn default() -> Self {
         Self::new()
@@ -810,7 +812,7 @@ where
 
 impl<'wait_list, L: Lock, I: Debug, O, OnCancel> Debug for Wait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
     L: Debug,
     <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Debug,
 {
@@ -831,7 +833,7 @@ pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct InitAndWait<'wait_list, L: Lock, I, O, OnCancel>
     where
-        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+        OnCancel: CancelCallback<'wait_list, L, I, O>,
     {
         input: Option<InitAndWaitInput<'wait_list, L, I, O, OnCancel>>,
         #[pin]
@@ -841,7 +843,7 @@ pin_project! {
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Future for InitAndWait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
     type Output = (LockedExclusive<'wait_list, L, I, O>, O);
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
@@ -864,7 +866,7 @@ where
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Debug for InitAndWait<'wait_list, L, I, O, OnCancel>
 where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    OnCancel: CancelCallback<'wait_list, L, I, O>,
     <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Debug,
     I: Debug,
     L: Debug,
@@ -887,6 +889,32 @@ struct InitAndWaitInput<'wait_list, L: Lock, I, O, OnCancel> {
     lock: LockedExclusive<'wait_list, L, I, O>,
     input: I,
     on_cancel: OnCancel,
+}
+
+/// A callback that is called in the event that the future has been woken but was cancelled before
+/// it could complete.
+///
+/// This trait is implemented for all functions and closures that accept a
+/// `LockedExclusive<'wait_list, L, I, O>` and an `O`, but is also available as a separate trait so
+/// you can implement it on concrete types.
+pub trait CancelCallback<'wait_list, L: Lock, I, O>: Sized {
+    /// Called when the future has been woken but was cancelled before it could complete.
+    ///
+    /// It is given an exclusive lock to the associated [`WaitList`] as well as the output value
+    /// that was not yielded by the future.
+    fn on_cancel(self, lock: LockedExclusive<'wait_list, L, I, O>, output: O);
+}
+
+impl<'wait_list, L: Lock, I, O, F> CancelCallback<'wait_list, L, I, O> for F
+where
+    L: 'wait_list,
+    I: 'wait_list,
+    O: 'wait_list,
+    F: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+{
+    fn on_cancel(self, lock: LockedExclusive<'wait_list, L, I, O>, output: O) {
+        self(lock, output);
+    }
 }
 
 struct PanicOnDrop;
@@ -1039,7 +1067,7 @@ mod tests {
 
         let mut f1 = Box::pin(list.lock_exclusive().init_and_wait(
             Box::new(1),
-            |mut list, mut output| {
+            |mut list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
                 *output += 1;
                 assert_eq!(*list.wake_one(output).unwrap(), 2);
             },
@@ -1048,7 +1076,7 @@ mod tests {
 
         let mut f2 = Box::pin(list.lock_exclusive().init_and_wait(
             Box::new(2),
-            |mut list, mut output| {
+            |mut list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
                 *output += 1;
                 assert_eq!(*list.wake_one(output).unwrap(), 3);
             },
@@ -1057,13 +1085,13 @@ mod tests {
 
         let mut final_output = None;
 
-        let mut f3 = Box::pin(
-            list.lock_exclusive()
-                .init_and_wait(Box::new(3), |list, output| {
-                    assert!(list.is_empty());
-                    final_output = Some(output);
-                }),
-        );
+        let mut f3 = Box::pin(list.lock_exclusive().init_and_wait(
+            Box::new(3),
+            |list: crate::LockedExclusive<_, Box<u8>, _>, output| {
+                assert!(list.is_empty());
+                final_output = Some(output);
+            },
+        ));
         assert!(f3.as_mut().poll(cx).is_pending());
 
         assert_eq!(*list.lock_exclusive().wake_one(Box::new(12)).unwrap(), 1);
