@@ -643,7 +643,7 @@ impl<'wait_list, L: Lock, I, O, OnCancel> Future for Wait<'wait_list, L, I, O, O
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
 {
-    type Output = (O, LockedExclusive<'wait_list, L, I, O>);
+    type Output = (LockedExclusive<'wait_list, L, I, O>, O);
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
         let mut state = self.project().state;
@@ -701,7 +701,7 @@ where
                         // taken again.
                         let output = unsafe { ManuallyDrop::take(output) };
                         state.set(WaitState::Done);
-                        Poll::Ready((output, lock))
+                        Poll::Ready((lock, output))
                     }
                 }
             }
@@ -863,7 +863,7 @@ mod tests {
 
         assert_eq!(*list.lock_exclusive().wake_one(Box::new(6)).unwrap(), 5);
         assert_eq!(
-            future.as_mut().poll(cx).map(|(output, _)| output),
+            future.as_mut().poll(cx).map(|(_, output)| output),
             Poll::Ready(Box::new(6))
         );
         assert!(list.lock_shared().is_empty());
@@ -897,11 +897,11 @@ mod tests {
         drop(list);
 
         assert_eq!(
-            f2.as_mut().poll(cx).map(|(output, _)| output),
+            f2.as_mut().poll(cx).map(|(_, output)| output),
             Poll::Ready(Box::new(12))
         );
         assert_eq!(
-            f1.as_mut().poll(cx).map(|(output, _)| output),
+            f1.as_mut().poll(cx).map(|(_, output)| output),
             Poll::Ready(Box::new(11))
         );
         drop(f3);
