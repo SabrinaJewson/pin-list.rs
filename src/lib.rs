@@ -48,10 +48,11 @@
 //!                 return Guard { mutex: self };
 //!             }
 //!
-//!             let on_cancel = wait_list::on_cancel_hrtb(|mut list, ()| {
-//!                 let _ = list.wake_one(());
-//!             });
-//!             future.as_mut().init_without_waker(&mut waiters, (), on_cancel);
+//!             future.as_mut().init_without_waker(
+//!                 &mut waiters,
+//!                 (),
+//!                 |mut list, ()| { let _ = list.wake_one(()); },
+//!             );
 //!         }
 //!     }
 //! }
@@ -541,14 +542,20 @@ pub struct Wait<'wait_list, L: Lock, I, O, OnCancel>
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
 {
-    state: WaitState<'wait_list, L, I, O, OnCancel>,
+    inner: WaitInner<'wait_list, L, I, O, OnCancel>,
 }
 
-#[allow(clippy::type_repetition_in_bounds)]
-unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for Wait<'wait_list, L, I, O, OnCancel>
-where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+pin_project! {
+    /// `Wait`, but without the bound on `OnCancel` so the `Send` bound doesn't need it. This is
+    /// used to work around <https://github.com/rust-lang/rust/issues/96865>.
+    struct WaitInner<'wait_list, L: Lock, I, O, OnCancel> {
+        #[pin]
+        state: WaitState<'wait_list, L, I, O, OnCancel>,
+    }
+}
 
+unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for WaitInner<'wait_list, L, I, O, OnCancel>
+where
     // - `L` is not required to be `Send` because we can't move or drop it with just our shared
     // reference to it.
     // - `L` is required to be `Sync` because we access it from a shared reference.
@@ -575,7 +582,9 @@ where
     /// `pin-project`.
     fn project(self: Pin<&mut Self>) -> Pin<&mut WaitState<'wait_list, L, I, O, OnCancel>> {
         let this = unsafe { Pin::into_inner_unchecked(self) };
-        unsafe { Pin::new_unchecked(&mut this.state) }
+        unsafe { Pin::new_unchecked(&mut this.inner) }
+            .project()
+            .state
     }
 }
 
@@ -583,10 +592,7 @@ pin_project! {
     /// The state of a `Wait` future.
     #[project = WaitStateProject]
     #[project_replace = WaitStateProjectReplace]
-    enum WaitState<'wait_list, L: Lock, I, O, OnCancel>
-    where
-        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-    {
+    enum WaitState<'wait_list, L: Lock, I, O, OnCancel> {
         /// We have been polled at least once and, if we haven't been woken, are still a node in
         /// the linked list.
         Waiting {
@@ -618,14 +624,16 @@ where
     /// [`init`]: Self::init
     pub fn new() -> Self {
         Self {
-            state: WaitState::Done,
+            inner: WaitInner {
+                state: WaitState::Done,
+            },
         }
     }
 
     /// Check whether this future is in its completed state or not.
     #[must_use]
     pub fn is_completed(&self) -> bool {
-        matches!(self.state, WaitState::Done)
+        matches!(self.inner.state, WaitState::Done)
     }
 
     /// Initialize the future, moving it from a completed to waiting state.
@@ -807,7 +815,7 @@ where
     <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.state {
+        match &self.inner.state {
             WaitState::Waiting { wait_list, .. } => f
                 .debug_struct("Wait::Waiting")
                 .field("wait_list", wait_list)
@@ -879,16 +887,6 @@ struct InitAndWaitInput<'wait_list, L: Lock, I, O, OnCancel> {
     lock: LockedExclusive<'wait_list, L, I, O>,
     input: I,
     on_cancel: OnCancel,
-}
-
-/// A no-op function to call on `on_cancel` callbacks to work around
-/// <https://github.com/rust-lang/rust/issues/96865>.
-#[must_use]
-pub fn on_cancel_hrtb<OnCancel, L: Lock, I, O>(function: OnCancel) -> OnCancel
-where
-    OnCancel: for<'a> FnOnce(LockedExclusive<'a, L, I, O>, O),
-{
-    function
 }
 
 struct PanicOnDrop;
