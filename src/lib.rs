@@ -12,6 +12,7 @@
 //! A thread-safe unfair async mutex.
 //!
 //! ```
+//! use pin_utils::pin_mut as pin;
 //! use std::cell::UnsafeCell;
 //! use std::ops::Deref;
 //! use std::ops::DerefMut;
@@ -32,17 +33,25 @@
 //!         }
 //!     }
 //!     pub async fn lock(&self) -> Guard<'_, T> {
+//!         let mut future = wait_list::Wait::new();
+//!         pin!(future);
 //!         loop {
-//!             wait_list::await_send_after_poll!({
-//!                 let mut waiters = self.waiters.lock_exclusive();
+//!             let mut waiters = if future.as_ref().is_completed() {
+//!                 self.waiters.lock_exclusive()
+//!             } else {
+//!                 let (waiters, ()) = (&mut future).await;
+//!                 waiters
+//!             };
 //!
-//!                 if !*waiters.guard {
-//!                     *waiters.guard = true;
-//!                     return Guard { mutex: self };
-//!                 }
+//!             if !*waiters.guard {
+//!                 *waiters.guard = true;
+//!                 return Guard { mutex: self };
+//!             }
 //!
-//!                 waiters.wait_hrtb((), |mut list, ()| { let _ = list.wake_one(()); })
+//!             let on_cancel = wait_list::on_cancel_hrtb(|mut list, ()| {
+//!                 let _ = list.wake_one(());
 //!             });
+//!             future.as_mut().init_without_waker(&mut waiters, (), on_cancel);
 //!         }
 //!     }
 //! }
@@ -117,6 +126,7 @@ use core::mem;
 use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::pin::Pin;
+use core::ptr;
 use core::ptr::NonNull;
 use core::task;
 use core::task::Poll;
@@ -126,15 +136,6 @@ use pinned_aliasable::Aliasable;
 pub mod lock;
 #[doc(no_inline)]
 pub use lock::Lock;
-
-mod send_after_poll;
-pub use send_after_poll::SendAfterPoll;
-
-// Not public API.
-#[doc(hidden)]
-pub mod __private {
-    pub use crate::send_after_poll::private as send_after_poll;
-}
 
 /// An intrusive linked list of futures.
 pub struct WaitList<L: Lock, I, O> {
@@ -384,38 +385,24 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
     /// cancelled before it could complete. You will often want to re-call [`Self::wake_one`] in
     /// this case to pass on the notification to someone else.
     ///
-    /// If your locks are thread-safe but their guard types are `!Send` (e.g. [`std::sync::Mutex`]
-    /// or `parking_lot`'s mutex without the `send_guard` feature) then the returned future will
-    /// also not be `Send` because it takes ownership of a mutex guard type. However, you can still
-    /// have futures that contain it be `Send`, as long as you await it using the
-    /// [`await_send_after_poll!`] macro instead of with `.await`.
-    pub fn wait<OnCancel>(
+    /// Note that the returned future will not be `Send` if your guard types are `!Send`. To avoid
+    /// this problem, use the lower-level [`Wait`] API instead.
+    pub fn init_and_wait<OnCancel>(
         self,
         input: I,
         on_cancel: OnCancel,
-    ) -> Wait<'wait_list, L, I, O, OnCancel>
+    ) -> InitAndWait<'wait_list, L, I, O, OnCancel>
     where
         OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
     {
-        Wait {
-            state: WaitState::Initial { guard: self, input },
-            on_cancel: ManuallyDrop::new(on_cancel),
+        InitAndWait {
+            input: Some(InitAndWaitInput {
+                lock: self,
+                input,
+                on_cancel,
+            }),
+            inner: Wait::new(),
         }
-    }
-
-    /// The exact same as [`wait`], but with a slightly different bound on `OnCancel` that can work
-    /// around compiler errors you might encounter sometimes.
-    ///
-    /// [`wait`]: Self::wait
-    pub fn wait_hrtb<OnCancel>(
-        self,
-        input: I,
-        on_cancel: OnCancel,
-    ) -> Wait<'wait_list, L, I, O, OnCancel>
-    where
-        OnCancel: for<'a> FnOnce(LockedExclusive<'a, L, I, O>, O),
-    {
-        self.wait(input, on_cancel)
     }
 
     /// Wake and dequeue the first waiter in the queue, if there is one.
@@ -542,23 +529,111 @@ impl<'wait_list, L: Lock + Debug, I, O> Debug for LockedCommon<'wait_list, L, I,
     }
 }
 
-/// The future of a waiting operation, created by [`LockedExclusive::wait`].
+/// The future of a waiting operation.
+///
+/// This type provides a lower-level API than [`LockedExclusive::init_and_wait`], but is useful
+/// if your guard types are `!Send` but you still want the outer future to remain `Send`.
+///
+/// Awaiting and polling this future will panic if you have not called [`init`] yet.
+///
+/// [`init`]: Self::init
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Wait<'wait_list, L: Lock, I, O, OnCancel>
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
 {
-    /// The state enum of the future.
-    state: WaitState<'wait_list, L, I, O>,
+    state: WaitState<'wait_list, L, I, O, OnCancel>,
+}
 
-    /// The callback to be called when the future has been woken but is cancelled before it could
-    /// return `Ready`.
-    on_cancel: ManuallyDrop<OnCancel>,
+impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+{
+    /// Create a new `Wait` future.
+    ///
+    /// The returned future will be in its "completed" state, so attempting to `.await` it will
+    /// panic unless [`init`] is called.
+    ///
+    /// [`init`]: Self::init
+    pub fn new() -> Self {
+        Self {
+            state: WaitState::Done,
+        }
+    }
+
+    /// Check whether this future is in its completed state or not.
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        matches!(self.state, WaitState::Done)
+    }
+
+    /// Initialize the future, moving it from a completed to waiting state.
+    ///
+    /// This function is mostly only useful inside a `poll` function (when you have a `cx`
+    /// variable to hand). After calling this, you should return [`Poll::Pending`] as the given
+    /// waker has been successfully registered in the wait list.
+    ///
+    /// A callback must be supplied to call in the event that the future has been woken but was
+    /// cancelled before it could complete. You will often want to re-call
+    /// [`LockedExclusive::wake_one`] in this case to pass on the notification to someone else.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a non-completed future.
+    pub fn init(
+        self: Pin<&mut Self>,
+        waker: task::Waker,
+        guard: &mut LockedExclusive<'wait_list, L, I, O>,
+        input: I,
+        on_cancel: OnCancel,
+    ) {
+        assert!(
+            self.as_ref().is_completed(),
+            "called `Wait::init` on an incomplete future"
+        );
+
+        let mut state = self.project();
+
+        // Construct and set the new `Waiting` state
+        let waiter = Aliasable::new(UnsafeCell::new(Waiter {
+            next: None,
+            prev: None,
+            state: WaiterState::Waiting { input, waker },
+        }));
+        state.set(WaitState::Waiting {
+            wait_list: guard.wait_list,
+            waiter,
+            on_cancel,
+        });
+
+        // Take a reference to the waiter and enqueue it in the linked list.
+        let waiter = match state.project() {
+            WaitStateProject::Waiting { waiter, .. } => waiter,
+            WaitStateProject::Done => unreachable!(),
+        };
+        unsafe { guard.inner_mut().enqueue(waiter.as_ref().get()) };
+    }
+
+    /// The same as [`init`] but not requiring a [`task::Waker`], instead substituting in a
+    /// temporary no-op waker.
+    ///
+    /// Using this API is always less efficient than writing a `poll` function manually that calls
+    /// [`init`], but it can be useful if you (a) need `Send` futures but have `!Send` mutex guards
+    /// and (b) want to stay in an `async` context.
+    ///
+    /// [`init`]: Self::init
+    pub fn init_without_waker(
+        self: Pin<&mut Self>,
+        guard: &mut LockedExclusive<'wait_list, L, I, O>,
+        input: I,
+        on_cancel: OnCancel,
+    ) {
+        self.init(noop_waker(), guard, input, on_cancel);
+    }
 }
 
 #[allow(clippy::type_repetition_in_bounds)]
-unsafe impl<'wait_list, L: Lock, I, O, OnCancel> SendAfterPoll
-    for Wait<'wait_list, L, I, O, OnCancel>
+unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for Wait<'wait_list, L, I, O, OnCancel>
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
 
@@ -580,37 +655,15 @@ where
 {
 }
 
-unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for Wait<'wait_list, L, I, O, OnCancel>
-where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-
-    // First of all, inherit all the bounds from when we are `SendAfterPoll`.
-    Self: SendAfterPoll,
-    // The additional thing we carry before we are polled is the lock guard, so that must be
-    // `Send`.
-    <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Send,
-{
-}
-
-/// Manual pin-projection because I need `Drop` and don't want to bring in the full `pin-project`.
-struct WaitProject<'future, 'wait_list, L: Lock, I, O, OnCancel>
-where
-    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
-{
-    state: Pin<&'future mut WaitState<'wait_list, L, I, O>>,
-    on_cancel: &'future mut ManuallyDrop<OnCancel>,
-}
-
 impl<'wait_list, L: Lock, I, O, OnCancel> Wait<'wait_list, L, I, O, OnCancel>
 where
     OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
 {
-    fn project(self: Pin<&mut Self>) -> WaitProject<'_, 'wait_list, L, I, O, OnCancel> {
+    /// Manual pin-projection because I need `Drop` and don't want to bring in the full
+    /// `pin-project`.
+    fn project(self: Pin<&mut Self>) -> Pin<&mut WaitState<'wait_list, L, I, O, OnCancel>> {
         let this = unsafe { Pin::into_inner_unchecked(self) };
-        WaitProject {
-            state: unsafe { Pin::new_unchecked(&mut this.state) },
-            on_cancel: &mut this.on_cancel,
-        }
+        unsafe { Pin::new_unchecked(&mut this.state) }
     }
 }
 
@@ -618,12 +671,10 @@ pin_project! {
     /// The state of a `Wait` future.
     #[project = WaitStateProject]
     #[project_replace = WaitStateProjectReplace]
-    enum WaitState<'wait_list, L: Lock, I, O> {
-        /// The `Wait` has not been polled yet.
-        Initial {
-            guard: LockedExclusive<'wait_list, L, I, O>,
-            input: I,
-        },
+    enum WaitState<'wait_list, L: Lock, I, O, OnCancel>
+    where
+        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    {
         /// We have been polled at least once and, if we haven't been woken, are still a node in
         /// the linked list.
         Waiting {
@@ -633,8 +684,12 @@ pin_project! {
             // The actual alised node in the `WaitList`'s linked list.
             #[pin]
             waiter: Aliasable<UnsafeCell<Waiter<I, O>>>,
+
+            // The callback to be called when the future has been woken but it is cancelled before
+            // it could return `Ready`.
+            on_cancel: OnCancel,
         },
-        /// We are finished.
+        /// We are either finished or we haven't been initialized yet.
         Done,
     }
 }
@@ -646,66 +701,39 @@ where
     type Output = (LockedExclusive<'wait_list, L, I, O>, O);
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.project().state;
+        let mut state = self.project();
 
-        match state.as_mut().project() {
-            WaitStateProject::Initial { .. } => {
-                // Temporarily insert the `Done` state so we can use the guard and input
-                let (mut guard, input) = match state.as_mut().project_replace(WaitState::Done) {
-                    WaitStateProjectReplace::Initial { guard, input } => (guard, input),
-                    _ => unreachable!(),
-                };
+        let (wait_list, waiter) = match state.as_mut().project() {
+            WaitStateProject::Waiting {
+                wait_list, waiter, ..
+            } => (wait_list, waiter),
+            WaitStateProject::Done => panic!("`Wait` polled after completion"),
+        };
 
-                // Construct the new `Waiting` state
-                let wait_list = guard.wait_list;
-                let waiter = Aliasable::new(UnsafeCell::new(Waiter {
-                    next: None,
-                    prev: None,
-                    state: WaiterState::Waiting {
-                        input,
-                        waker: cx.waker().clone(),
-                    },
-                }));
-                state.set(WaitState::Waiting { wait_list, waiter });
+        let lock = wait_list.lock_exclusive();
 
-                // Take a reference to the waiter and enqueue it in the linked list.
-                let waiter = match state.project() {
-                    WaitStateProject::Waiting { waiter, .. } => waiter,
-                    _ => unreachable!(),
-                };
-                unsafe { guard.inner_mut().enqueue(waiter.as_ref().get()) };
+        // SAFETY: We hold the exclusive lock to the linked list.
+        let waiter = unsafe { &mut *waiter.as_ref().get().get() };
 
-                // Pend, since we've cloned the waker and added it in the list already
+        // Check whether we've been woken or not
+        match &mut waiter.state {
+            // Still waiting, just refresh our waker and pend
+            WaiterState::Waiting { waker, .. } => {
+                // If necessary, update the waker to the new one.
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
                 Poll::Pending
             }
-            WaitStateProject::Waiting { wait_list, waiter } => {
-                let lock = wait_list.lock_exclusive();
-
-                // SAFETY: We hold the exclusive lock to the linked list.
-                let waiter = unsafe { &mut *waiter.as_ref().get().get() };
-
-                // Check whether we've been woken or not
-                match &mut waiter.state {
-                    // Still waiting, just refresh our waker and pend
-                    WaiterState::Waiting { waker, .. } => {
-                        // If necessary, update the waker to the new one.
-                        if !waker.will_wake(cx.waker()) {
-                            *waker = cx.waker().clone();
-                        }
-                        Poll::Pending
-                    }
-                    // We have been woken! Take the output, set ourselves to the Done state and
-                    // report that we are ready. Dequeuing has already been managed by the waker.
-                    WaiterState::Woken { output } => {
-                        // SAFETY: After this, we set the state to `Done` so that it will never be
-                        // taken again.
-                        let output = unsafe { ManuallyDrop::take(output) };
-                        state.set(WaitState::Done);
-                        Poll::Ready((lock, output))
-                    }
-                }
+            // We have been woken! Take the output, set ourselves to the Done state and
+            // report that we are ready. Dequeuing has already been managed by the waker.
+            WaiterState::Woken { output } => {
+                // SAFETY: After this, we set the state to `Done` so that it will never be
+                // taken again.
+                let output = unsafe { ManuallyDrop::take(output) };
+                state.set(WaitState::Done);
+                Poll::Ready((lock, output))
             }
-            WaitStateProject::Done => panic!("`Wait` polled after completion"),
         }
     }
 }
@@ -717,18 +745,14 @@ where
     fn drop(&mut self) {
         // This is necessary for soundness since we were pinned before in our `poll` function
         let this = unsafe { Pin::new_unchecked(self) };
-        let WaitProject { state, on_cancel } = this.project();
+        let mut state = this.project();
 
-        // SAFETY: This is in the destructor, so it is only called once, and we never call it
-        // outside here.
-        let on_cancel = unsafe { ManuallyDrop::take(on_cancel) };
-
-        match state.project() {
-            // No need to do anything if we didn't start to run or have completed.
-            WaitStateProject::Initial { .. } | WaitStateProject::Done => {}
+        match state.as_mut().project() {
             // If we were waiting, we now need to remove ourselves from the linked list so they
             // don't access our freed memory.
-            WaitStateProject::Waiting { wait_list, waiter } => {
+            WaitStateProject::Waiting {
+                wait_list, waiter, ..
+            } => {
                 // Set up a guard that panics on drop, in order to cause an abort should
                 // `lock_exclusive` panic. This is necessary because we absolutely must remove the
                 // waiter from the linked list before returning here otherwise we can cause
@@ -739,6 +763,8 @@ where
 
                 let waiter = waiter.as_ref().get();
 
+                // Case 1: We were still waiting before we were cancelled; just remove ourselves
+                // from the list and do nothing more.
                 if let WaiterState::Waiting { .. } = unsafe { &(*waiter.get()).state } {
                     // Dequeue ourselves so we can safely drop everything while no-one references
                     // it.
@@ -748,14 +774,30 @@ where
                 // Disarm the guard, we no longer need to abort on a panic.
                 mem::forget(abort_on_panic);
 
+                // Case 2: We have been woken but were cancelled before our `poll` could handle
+                // the notification. Defer to the user-provided callback to decide what to do.
                 if let WaiterState::Woken { output } = unsafe { &mut (*waiter.get()).state } {
-                    // We have been woken but were cancelled before our `poll` could handle the
-                    // notification. Defer to the user-provided callback to decide what to do.
                     let output = unsafe { ManuallyDrop::take(output) };
+
+                    let on_cancel = match state.project_replace(WaitState::Done) {
+                        WaitStateProjectReplace::Waiting { on_cancel, .. } => on_cancel,
+                        WaitStateProjectReplace::Done => unreachable!(),
+                    };
                     on_cancel(list, output);
                 }
             }
+            // No need to do anything if we didn't start to run or have completed.
+            WaitStateProject::Done => {}
         }
+    }
+}
+
+impl<'wait_list, L: Lock, I, O, OnCancel> Default for Wait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -767,21 +809,87 @@ where
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.state {
-            WaitState::Initial { guard, input } => f
-                .debug_struct("Wait::Initial")
-                .field("guard", guard)
-                .field("input", input)
-                .finish(),
-            WaitState::Waiting {
-                wait_list,
-                waiter: _,
-            } => f
+            WaitState::Waiting { wait_list, .. } => f
                 .debug_struct("Wait::Waiting")
                 .field("wait_list", wait_list)
                 .finish(),
             WaitState::Done => f.pad("Wait::Done"),
         }
     }
+}
+
+pin_project! {
+    /// A future that both initializes and waits on a [`WaitList`], created by
+    /// [`LockedExclusive::init_and_wait`].
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct InitAndWait<'wait_list, L: Lock, I, O, OnCancel>
+    where
+        OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    {
+        input: Option<InitAndWaitInput<'wait_list, L, I, O, OnCancel>>,
+        #[pin]
+        inner: Wait<'wait_list, L, I, O, OnCancel>,
+    }
+}
+
+impl<'wait_list, L: Lock, I, O, OnCancel> Future for InitAndWait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+{
+    type Output = (LockedExclusive<'wait_list, L, I, O>, O);
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        if let Some(InitAndWaitInput {
+            mut lock,
+            input,
+            on_cancel,
+        }) = this.input.take()
+        {
+            this.inner
+                .init(cx.waker().clone(), &mut lock, input, on_cancel);
+            Poll::Pending
+        } else {
+            this.inner.poll(cx)
+        }
+    }
+}
+
+impl<'wait_list, L: Lock, I, O, OnCancel> Debug for InitAndWait<'wait_list, L, I, O, OnCancel>
+where
+    OnCancel: FnOnce(LockedExclusive<'wait_list, L, I, O>, O),
+    <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Debug,
+    I: Debug,
+    L: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(input) = &self.input {
+            f.debug_struct("InitAndWait::Initial")
+                .field("lock", &input.lock)
+                .field("input", &input.input)
+                .finish()
+        } else {
+            f.debug_struct("InitAndWait::Waiting")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+}
+
+struct InitAndWaitInput<'wait_list, L: Lock, I, O, OnCancel> {
+    lock: LockedExclusive<'wait_list, L, I, O>,
+    input: I,
+    on_cancel: OnCancel,
+}
+
+/// A no-op function to call on `on_cancel` callbacks to work around
+/// <https://github.com/rust-lang/rust/issues/96865>.
+#[must_use]
+pub fn on_cancel_hrtb<OnCancel, L: Lock, I, O>(function: OnCancel) -> OnCancel
+where
+    OnCancel: for<'a> FnOnce(LockedExclusive<'a, L, I, O>, O),
+{
+    function
 }
 
 struct PanicOnDrop;
@@ -791,40 +899,36 @@ impl Drop for PanicOnDrop {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "std")]
+const fn noop_waker() -> task::Waker {
+    const VTABLE: task::RawWakerVTable = task::RawWakerVTable::new(
+        // clone
+        |_| RAW,
+        // wake
+        |_| {},
+        // wake_by_ref
+        |_| {},
+        // drop
+        |_| {},
+    );
+    const RAW: task::RawWaker = task::RawWaker::new(ptr::null(), &VTABLE);
+
+    // SAFETY: `Waker` is `#[repr(transparent)]` over `RawWaker`
+    unsafe { mem::transmute::<task::RawWaker, task::Waker>(RAW) }
+}
+
+#[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::await_send_after_poll;
     use super::WaitList;
     use crate::lock;
     use crate::lock::Lock;
-    use crate::test_util::AssertNotSend;
-    use crate::test_util::AssertSend;
     use alloc::boxed::Box;
     use core::future::Future;
-    use core::mem;
-    use core::ptr;
     use core::task;
     use core::task::Poll;
-    use std::sync::Mutex;
 
     // Never type, but it's actually latin letter retroflex click
     #[derive(Debug, PartialEq)]
     enum ǃ {}
-
-    #[test]
-    fn send_futures() {
-        let list = <WaitList<Mutex<()>, (), ǃ>>::default();
-        async { await_send_after_poll!(list.lock_exclusive().wait((), no_cancel)) }.assert_send();
-        async { list.lock_exclusive().wait((), no_cancel).await }.assert_not_send();
-    }
-
-    #[test]
-    fn not_send_futures() {
-        let list = <WaitList<crate::lock::Local<()>, (), ǃ>>::default();
-        async { await_send_after_poll!(list.lock_exclusive().wait((), no_cancel)) }
-            .assert_not_send();
-    }
 
     #[test]
     fn wake_empty() {
@@ -841,7 +945,7 @@ mod tests {
         let cx = &mut noop_cx();
 
         let list = <WaitList<lock::Local<()>, Box<u32>, ǃ>>::default();
-        let mut future = Box::pin(list.lock_exclusive().wait(Box::new(5), no_cancel));
+        let mut future = Box::pin(list.lock_exclusive().init_and_wait(Box::new(5), no_cancel));
         for _ in 0..10 {
             assert!(future.as_mut().poll(cx).is_pending());
         }
@@ -858,7 +962,7 @@ mod tests {
 
         let list = <WaitList<lock::Local<()>, Box<u8>, Box<u32>>>::default();
 
-        let mut future = Box::pin(list.lock_exclusive().wait(Box::new(5), no_cancel));
+        let mut future = Box::pin(list.lock_exclusive().init_and_wait(Box::new(5), no_cancel));
         assert!(future.as_mut().poll(cx).is_pending());
 
         assert_eq!(*list.lock_exclusive().wake_one(Box::new(6)).unwrap(), 5);
@@ -875,10 +979,10 @@ mod tests {
 
         let list = <WaitList<lock::Local<()>, Box<u8>, Box<u32>>>::default();
 
-        let mut f1 = Box::pin(list.lock_exclusive().wait(Box::new(1), no_cancel));
+        let mut f1 = Box::pin(list.lock_exclusive().init_and_wait(Box::new(1), no_cancel));
         assert!(f1.as_mut().poll(cx).is_pending());
 
-        let mut f2 = Box::pin(list.lock_exclusive().wait(Box::new(2), no_cancel));
+        let mut f2 = Box::pin(list.lock_exclusive().init_and_wait(Box::new(2), no_cancel));
         assert!(f2.as_mut().poll(cx).is_pending());
 
         assert_eq!(*list.lock_exclusive().wake_one(Box::new(11)).unwrap(), 1);
@@ -886,7 +990,7 @@ mod tests {
         let mut f3_out = None;
         let mut f3 = Box::pin(
             list.lock_exclusive()
-                .wait(Box::new(3), |_, out| f3_out = Some(out)),
+                .init_and_wait(Box::new(3), |_, out| f3_out = Some(out)),
         );
         assert!(f3.as_mut().poll(cx).is_pending());
 
@@ -914,13 +1018,13 @@ mod tests {
 
         let list = <WaitList<lock::Local<()>, Box<u32>, ǃ>>::default();
 
-        let mut f1 = Box::pin(list.lock_exclusive().wait(Box::new(1), no_cancel));
+        let mut f1 = Box::pin(list.lock_exclusive().init_and_wait(Box::new(1), no_cancel));
         assert!(f1.as_mut().poll(cx).is_pending());
 
-        let mut f2 = Box::pin(list.lock_exclusive().wait(Box::new(2), no_cancel));
+        let mut f2 = Box::pin(list.lock_exclusive().init_and_wait(Box::new(2), no_cancel));
         assert!(f2.as_mut().poll(cx).is_pending());
 
-        let mut f3 = Box::pin(list.lock_exclusive().wait(Box::new(3), no_cancel));
+        let mut f3 = Box::pin(list.lock_exclusive().init_and_wait(Box::new(3), no_cancel));
         assert!(f3.as_mut().poll(cx).is_pending());
 
         drop(f2);
@@ -936,30 +1040,33 @@ mod tests {
 
         let list = <WaitList<lock::Local<()>, Box<u8>, Box<u32>>>::default();
 
-        let mut f1 = Box::pin(
-            list.lock_exclusive()
-                .wait(Box::new(1), |mut list, mut output| {
-                    *output += 1;
-                    assert_eq!(*list.wake_one(output).unwrap(), 2);
-                }),
-        );
+        let mut f1 = Box::pin(list.lock_exclusive().init_and_wait(
+            Box::new(1),
+            |mut list, mut output| {
+                *output += 1;
+                assert_eq!(*list.wake_one(output).unwrap(), 2);
+            },
+        ));
         assert!(f1.as_mut().poll(cx).is_pending());
 
-        let mut f2 = Box::pin(
-            list.lock_exclusive()
-                .wait(Box::new(2), |mut list, mut output| {
-                    *output += 1;
-                    assert_eq!(*list.wake_one(output).unwrap(), 3);
-                }),
-        );
+        let mut f2 = Box::pin(list.lock_exclusive().init_and_wait(
+            Box::new(2),
+            |mut list, mut output| {
+                *output += 1;
+                assert_eq!(*list.wake_one(output).unwrap(), 3);
+            },
+        ));
         assert!(f2.as_mut().poll(cx).is_pending());
 
         let mut final_output = None;
 
-        let mut f3 = Box::pin(list.lock_exclusive().wait(Box::new(3), |list, output| {
-            assert!(list.is_empty());
-            final_output = Some(output);
-        }));
+        let mut f3 = Box::pin(
+            list.lock_exclusive()
+                .init_and_wait(Box::new(3), |list, output| {
+                    assert!(list.is_empty());
+                    final_output = Some(output);
+                }),
+        );
         assert!(f3.as_mut().poll(cx).is_pending());
 
         assert_eq!(*list.lock_exclusive().wake_one(Box::new(12)).unwrap(), 1);
@@ -976,21 +1083,7 @@ mod tests {
     }
 
     fn noop_cx() -> task::Context<'static> {
-        const VTABLE: task::RawWakerVTable = task::RawWakerVTable::new(
-            // clone
-            |_| RAW,
-            // wake
-            |_| {},
-            // wake_by_ref
-            |_| {},
-            // drop
-            |_| {},
-        );
-        const RAW: task::RawWaker = task::RawWaker::new(ptr::null(), &VTABLE);
-
-        // SAFETY: `Waker` is `#[repr(transparent)]` over `RawWaker`
-        static WAKER: task::Waker = unsafe { mem::transmute::<task::RawWaker, task::Waker>(RAW) };
-
+        static WAKER: task::Waker = crate::noop_waker();
         task::Context::from_waker(&WAKER)
     }
 }

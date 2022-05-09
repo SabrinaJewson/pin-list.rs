@@ -14,6 +14,7 @@ integration of crates like [`parking_lot`], [`spin`] and [`usync`].
 A thread-safe unfair async mutex.
 
 ```rust
+use pin_utils::pin_mut as pin;
 use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -34,17 +35,25 @@ impl<T> Mutex<T> {
         }
     }
     pub async fn lock(&self) -> Guard<'_, T> {
+        let mut future = wait_list::Wait::new();
+        pin!(future);
         loop {
-            wait_list::await_send_after_poll!({
-                let mut waiters = self.waiters.lock_exclusive();
+            let mut waiters = if future.as_ref().is_completed() {
+                self.waiters.lock_exclusive()
+            } else {
+                let (waiters, ()) = (&mut future).await;
+                waiters
+            };
 
-                if !*waiters.guard {
-                    *waiters.guard = true;
-                    return Guard { mutex: self };
-                }
+            if !*waiters.guard {
+                *waiters.guard = true;
+                return Guard { mutex: self };
+            }
 
-                waiters.wait_hrtb((), |mut list, ()| { let _ = list.wake_one(()); })
+            let on_cancel = wait_list::on_cancel_hrtb(|mut list, ()| {
+                let _ = list.wake_one(());
             });
+            future.as_mut().init_without_waker(&mut waiters, (), on_cancel);
         }
     }
 }
