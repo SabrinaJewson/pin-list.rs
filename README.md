@@ -14,10 +14,14 @@ integration of crates like [`parking_lot`], [`spin`] and [`usync`].
 A thread-safe unfair async mutex.
 
 ```rust
-use pin_utils::pin_mut as pin;
+use pin_project_lite::pin_project;
 use std::cell::UnsafeCell;
+use std::future::Future;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::pin::Pin;
+use std::task;
+use std::task::Poll;
 use wait_list::WaitList;
 
 pub struct Mutex<T> {
@@ -34,27 +38,61 @@ impl<T> Mutex<T> {
             waiters: WaitList::new(std::sync::Mutex::new(false)),
         }
     }
-    pub async fn lock(&self) -> Guard<'_, T> {
-        let mut future = wait_list::Wait::new();
-        pin!(future);
-        loop {
-            let mut waiters = if future.as_ref().is_completed() {
-                self.waiters.lock_exclusive()
-            } else {
-                let (waiters, ()) = (&mut future).await;
-                waiters
-            };
-
-            if !*waiters.guard {
-                *waiters.guard = true;
-                return Guard { mutex: self };
-            }
-
-            let on_cancel = wait_list::on_cancel_hrtb(|mut list, ()| {
-                let _ = list.wake_one(());
-            });
-            future.as_mut().init_without_waker(&mut waiters, (), on_cancel);
+    pub fn lock(&self) -> Lock<'_, T> {
+        Lock {
+            mutex: self,
+            inner: wait_list::Wait::new(),
         }
+    }
+}
+
+pin_project! {
+    pub struct Lock<'mutex, T> {
+        mutex: &'mutex Mutex<T>,
+        #[pin]
+        inner: wait_list::Wait<'mutex, std::sync::Mutex<bool>, (), (), TryForward>,
+    }
+}
+
+impl<'mutex, T> Future for Lock<'mutex, T> {
+    type Output = Guard<'mutex, T>;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        let mut waiters = if this.inner.as_ref().is_completed() {
+            // If we haven't initialized the future yet, lock the mutex for the first time
+            this.mutex.waiters.lock_exclusive()
+        } else {
+            // Otherwise, wait for us to be woken
+            match this.inner.as_mut().poll(cx) {
+                Poll::Ready((waiters, ())) => waiters,
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+
+        // If the mutex is unlocked, mark it as locked and return the guard
+        if !*waiters.guard {
+            *waiters.guard = true;
+            return Poll::Ready(Guard { mutex: this.mutex });
+        }
+
+        // Otherwise, re-register ourselves to be woken when the mutex is unlocked again
+        this.inner.init(cx.waker().clone(), &mut waiters, (), TryForward);
+        Poll::Pending
+    }
+}
+
+/// When the future is cancelled before the mutex guard can be taken, wake up the next waiter.
+struct TryForward;
+impl<'wait_list> wait_list::CancelCallback<'wait_list, std::sync::Mutex<bool>, (), ()>
+    for TryForward
+{
+    fn on_cancel(
+        self,
+        mut list: wait_list::LockedExclusive<'wait_list, std::sync::Mutex<bool>, (), ()>,
+        output: (),
+    ) {
+        let _ = list.wake_one(());
     }
 }
 
