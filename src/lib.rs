@@ -443,14 +443,18 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
         }
     }
 
-    /// Wake and dequeue the first waiter in the queue, if there is one.
+    /// Pop the first waiter from the front of the queue, if there is one.
     ///
-    /// Returns ownership of that waiter's input value.
+    /// Returns ownership of that waiter's input value and the waker that can be used to wake it.
+    ///
+    /// It is recommended to only wake the waker when the lock guard is _not_ held, because waking
+    /// the waker may attempt to drop the future (if for example the runtime is shutting down)
+    /// which would deadlock if the future is registered in `WaitList`.
     ///
     /// # Errors
     ///
     /// Returns an error and gives back the given output when there are no wakers in the list.
-    pub fn wake_one(&mut self, output: O) -> Result<I, O> {
+    pub fn pop(&mut self, output: O) -> Result<(I, task::Waker), O> {
         let head = match self.inner_mut().head {
             Some(head) => head,
             None => return Err(output),
@@ -473,9 +477,23 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
         // Dequeue the first waiter now that it's not necessary to keep it in the queue.
         unsafe { self.inner_mut().dequeue(head.as_ref()) };
 
-        // Wake the waker last, to ensure that if this panics nothing goes wrong.
-        waker.wake();
+        Ok((input, waker))
+    }
 
+    /// Wake and dequeue the first waiter in the queue, if there is one.
+    ///
+    /// Returns ownership of that waiter's input value.
+    ///
+    /// This method consumes `self` so we can ensure that the lock guard is freed before calling
+    /// `wake` on the waker, to prevent deadlocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and gives back the given output when there are no wakers in the list.
+    pub fn wake_one(mut self, output: O) -> Result<I, O> {
+        let (input, waker) = self.pop(output)?;
+        drop(self);
+        waker.wake();
         Ok(input)
     }
 }
@@ -1054,11 +1072,9 @@ mod tests {
         );
         assert!(f3.as_mut().poll(cx).is_pending());
 
-        let mut list = list.lock_exclusive();
-        assert_eq!(*list.wake_one(Box::new(12)).unwrap(), 2);
-        assert_eq!(*list.wake_one(Box::new(13)).unwrap(), 3);
-        assert_eq!(*list.wake_one(Box::new(99)).unwrap_err(), 99);
-        drop(list);
+        assert_eq!(*list.lock_exclusive().wake_one(Box::new(12)).unwrap(), 2);
+        assert_eq!(*list.lock_exclusive().wake_one(Box::new(13)).unwrap(), 3);
+        assert_eq!(*list.lock_exclusive().wake_one(Box::new(9)).unwrap_err(), 9);
 
         assert_eq!(
             f2.as_mut().poll(cx).map(|(_, output)| output),
@@ -1102,7 +1118,7 @@ mod tests {
 
         let mut f1 = Box::pin(list.lock_exclusive().init_and_wait(
             Box::new(1),
-            |mut list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
+            |list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
                 *output += 1;
                 assert_eq!(*list.wake_one(output).unwrap(), 2);
             },
@@ -1111,7 +1127,7 @@ mod tests {
 
         let mut f2 = Box::pin(list.lock_exclusive().init_and_wait(
             Box::new(2),
-            |mut list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
+            |list: crate::LockedExclusive<_, Box<u8>, _>, mut output: Box<u32>| {
                 *output += 1;
                 assert_eq!(*list.wake_one(output).unwrap(), 3);
             },
