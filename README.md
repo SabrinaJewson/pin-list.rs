@@ -8,6 +8,7 @@ is implemented as an intrusive linked list of futures.
 - `std`: Implements the `Lock` traits on locks from the standard library.
 - `lock_api_04`: Implements the `Lock` traits on locks from [`lock_api`] v0.4. This enables
 integration of crates like [`parking_lot`], [`spin`] and [`usync`].
+- `loom_05`: Implements the `Lock` traits on locks from [`loom`] v0.5.
 
 ## Example
 
@@ -126,5 +127,6 @@ impl<T> Drop for Guard<'_, T> {
 [`parking_lot`]: https://docs.rs/parking_lot
 [`spin`]: https://docs.rs/spin
 [`usync`]: https://docs.rs/usync
+[`loom`]: https://docs.rs/loom
 
 License: MIT
