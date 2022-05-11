@@ -166,7 +166,6 @@ use core::fmt::Debug;
 use core::fmt::Formatter;
 use core::future::Future;
 use core::mem;
-use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::ptr;
@@ -264,11 +263,7 @@ enum WaiterState<I, O> {
     Waiting { input: I, waker: task::Waker },
 
     /// The waiter has been woken.
-    Woken {
-        /// The output value given to `wake_one`. This is `ManuallyDrop` to allow the `Wait` future
-        /// to take ownership of it in its destructor.
-        output: ManuallyDrop<O>,
-    },
+    Woken { output: O },
 }
 
 impl<I, O> Inner<I, O> {
@@ -470,9 +465,7 @@ impl<'wait_list, L: Lock, I, O> LockedExclusive<'wait_list, L, I, O> {
             let head_waiter = unsafe { &mut *head.as_ref().get() };
 
             // Mark the head node's state as done.
-            let new_state = WaiterState::Woken {
-                output: ManuallyDrop::new(output),
-            };
+            let new_state = WaiterState::Woken { output };
             match mem::replace(&mut head_waiter.state, new_state) {
                 WaiterState::Waiting { input, waker } => (input, waker),
                 WaiterState::Woken { .. } => unreachable!(),
@@ -602,35 +595,43 @@ pub struct Wait<'wait_list, L: Lock, I, O, OnCancel>
 where
     OnCancel: CancelCallback<'wait_list, L, I, O>,
 {
-    inner: WaitInner<'wait_list, L, I, O, OnCancel>,
+    inner: Option<WaitInner<'wait_list, L, I, O, OnCancel>>,
 }
 
 pin_project! {
-    /// `Wait`, but without the bound on `OnCancel` so the `Send` bound doesn't need it. This is
+    /// Intentionally avoids bounding `OnCancel` so the `Send` bound doesn't need it. This is
     /// used to work around <https://github.com/rust-lang/rust/issues/96865>.
     struct WaitInner<'wait_list, L: Lock, I, O, OnCancel> {
+        // The list this future is a part of.
+        wait_list: &'wait_list WaitList<L, I, O>,
+
+        // The actual aliased node in the `WaitList`'s linked list.
         #[pin]
-        state: WaitState<'wait_list, L, I, O, OnCancel>,
+        waiter: Aliasable<UnsafeCell<Waiter<I, O>>>,
+
+        // The callback to be called when the future has been woken but it is cancelled before
+        // it could return `Ready`.
+        on_cancel: OnCancel,
     }
 }
 
 unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Send for WaitInner<'wait_list, L, I, O, OnCancel>
 where
-    // - `L` is not required to be `Send` because we can't move or drop it with just our shared
-    // reference to it.
-    // - `L` is required to be `Sync` because we access it from a shared reference.
-    L: Sync,
-    // - `I` is required to be `Send` because we own it and will drop it if we are dropped.
-    // - `I` is not required to be `Sync` because we don't ever touch a shared reference to it post
-    // placing it in the linked list node; all access to it is done by the `WaitList` itself.
-    I: Send,
-    // - `O` is required to be `Send` because we can own an instance of it and give back ownership
-    // of that instance.
-    // - `O` is not required to be `Sync` because we never deal in `&O`.
-    O: Send,
+    // We hold and expose a shared reference to the `WaitList`.
+    WaitList<L, I, O>: Sync,
     // - `OnCancel` is required to be `Send` because we always own an instance of it.
-    // - `OnCancel` is not required to be `Sync` because we never deal in `&OnCancel`.
+    // - `OnCancel` is not required to be `Sync` because we don't deal in `&OnCancel`.
     OnCancel: Send,
+{
+}
+
+unsafe impl<'wait_list, L: Lock, I, O, OnCancel> Sync for WaitInner<'wait_list, L, I, O, OnCancel>
+where
+    // We hold and expose a shared reference to the `WaitList`.
+    WaitList<L, I, O>: Sync,
+    // This type supports accessing `&O` from a shared reference to `self`.
+    O: Sync,
+    // `OnCancel` is not required to be `Sync` because we don't deal in `&OnCancel`.
 {
 }
 
@@ -640,35 +641,9 @@ where
 {
     /// Manual pin-projection because I need `Drop` and don't want to bring in the full
     /// `pin-project`.
-    fn project(self: Pin<&mut Self>) -> Pin<&mut WaitState<'wait_list, L, I, O, OnCancel>> {
+    fn project(self: Pin<&mut Self>) -> Pin<&mut Option<WaitInner<'wait_list, L, I, O, OnCancel>>> {
         let this = unsafe { Pin::into_inner_unchecked(self) };
         unsafe { Pin::new_unchecked(&mut this.inner) }
-            .project()
-            .state
-    }
-}
-
-pin_project! {
-    /// The state of a `Wait` future.
-    #[project = WaitStateProject]
-    #[project_replace = WaitStateProjectReplace]
-    enum WaitState<'wait_list, L: Lock, I, O, OnCancel> {
-        /// We have been polled at least once and, if we haven't been woken, are still a node in
-        /// the linked list.
-        Waiting {
-            // The list this future is a part of.
-            wait_list: &'wait_list WaitList<L, I, O>,
-
-            // The actual alised node in the `WaitList`'s linked list.
-            #[pin]
-            waiter: Aliasable<UnsafeCell<Waiter<I, O>>>,
-
-            // The callback to be called when the future has been woken but it is cancelled before
-            // it could return `Ready`.
-            on_cancel: OnCancel,
-        },
-        /// We are either finished or we haven't been initialized yet.
-        Done,
     }
 }
 
@@ -683,17 +658,13 @@ where
     ///
     /// [`init`]: Self::init
     pub fn new() -> Self {
-        Self {
-            inner: WaitInner {
-                state: WaitState::Done,
-            },
-        }
+        Self { inner: None }
     }
 
     /// Check whether this future is in its completed state or not.
     #[must_use]
     pub fn is_completed(&self) -> bool {
-        matches!(self.inner.state, WaitState::Done)
+        self.inner.is_none()
     }
 
     /// Initialize the future, moving it from a completed to waiting state.
@@ -721,7 +692,7 @@ where
             "called `Wait::init` on an incomplete future"
         );
 
-        let mut state = self.project();
+        let mut inner = self.project();
 
         // Construct and set the new `Waiting` state
         let waiter = Aliasable::new(UnsafeCell::new(Waiter {
@@ -729,18 +700,16 @@ where
             prev: None,
             state: WaiterState::Waiting { input, waker },
         }));
-        state.set(WaitState::Waiting {
+        inner.set(Some(WaitInner {
             wait_list: guard.wait_list,
             waiter,
             on_cancel,
-        });
+        }));
 
         // Take a reference to the waiter and enqueue it in the linked list.
-        let waiter = match state.project() {
-            WaitStateProject::Waiting { waiter, .. } => waiter,
-            WaitStateProject::Done => unreachable!(),
-        };
-        unsafe { guard.inner_mut().enqueue(waiter.as_ref().get()) };
+        let inner = inner.as_ref().as_pin_ref().unwrap();
+        let waiter = inner.project_ref().waiter.get();
+        unsafe { guard.inner_mut().enqueue(waiter) };
     }
 
     /// The same as [`init`] but not requiring a [`task::Waker`], instead substituting in a
@@ -759,6 +728,22 @@ where
     ) {
         self.init(noop_waker(), guard, input, on_cancel);
     }
+
+    fn inner(&self) -> Pin<&WaitInner<'wait_list, L, I, O, OnCancel>> {
+        let inner = self.inner.as_ref().expect("`Wait` is in completed state");
+        // SAFETY: In order for this state to be set, we must already be pinned.
+        unsafe { Pin::new_unchecked(inner) }
+    }
+
+    /// Retrieve a shared reference to the [`WaitList`] this [`Wait`] is currently associated with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wait is currently in the "completed" state.
+    #[must_use]
+    pub fn wait_list(&self) -> &'wait_list WaitList<L, I, O> {
+        self.inner().wait_list
+    }
 }
 
 impl<'wait_list, L: Lock, I, O, OnCancel> Future for Wait<'wait_list, L, I, O, OnCancel>
@@ -768,19 +753,14 @@ where
     type Output = (LockedExclusive<'wait_list, L, I, O>, O);
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.project();
+        let inner = self.inner().project_ref();
 
-        let (wait_list, waiter) = match state.as_mut().project() {
-            WaitStateProject::Waiting {
-                wait_list, waiter, ..
-            } => (wait_list, waiter),
-            WaitStateProject::Done => panic!("`Wait` polled after completion"),
-        };
+        let lock = inner.wait_list.lock_exclusive();
 
-        let lock = wait_list.lock_exclusive();
+        let waiter = inner.waiter.get();
 
         // SAFETY: We hold the exclusive lock to the linked list.
-        let waiter = unsafe { &mut *waiter.as_ref().get().get() };
+        let waiter = unsafe { &mut *waiter.get() };
 
         // Check whether we've been woken or not
         match &mut waiter.state {
@@ -794,11 +774,15 @@ where
             }
             // We have been woken! Take the output, set ourselves to the Done state and
             // report that we are ready. Dequeuing has already been managed by the waker.
-            WaiterState::Woken { output } => {
-                // SAFETY: After this, we set the state to `Done` so that it will never be
-                // taken again.
-                let output = unsafe { ManuallyDrop::take(output) };
-                state.set(WaitState::Done);
+            WaiterState::Woken { .. } => {
+                // SAFETY: We are no longer queued in the list, so we don't need to be `!Unpin`
+                // anymore.
+                let inner = unsafe { Pin::into_inner_unchecked(self.project()) };
+                let old_inner = inner.take().unwrap();
+                let output = match old_inner.waiter.into_inner().into_inner().state {
+                    WaiterState::Woken { output } => output,
+                    WaiterState::Waiting { .. } => unreachable!(),
+                };
                 Poll::Ready((lock, output))
             }
         }
@@ -812,49 +796,39 @@ where
     fn drop(&mut self) {
         // This is necessary for soundness since we were pinned before in our `poll` function
         let this = unsafe { Pin::new_unchecked(self) };
-        let mut state = this.project();
 
-        match state.as_mut().project() {
-            // If we were waiting, we now need to remove ourselves from the linked list so they
-            // don't access our freed memory.
-            WaitStateProject::Waiting {
-                wait_list, waiter, ..
-            } => {
-                // Set up a guard that panics on drop, in order to cause an abort should
-                // `lock_exclusive` panic. This is necessary because we absolutely must remove the
-                // waiter from the linked list before returning here otherwise we can cause
-                // use-after-frees.
-                let abort_on_panic = PanicOnDrop;
+        // No need to do anything if we're already completed or haven't been started.
+        if this.is_completed() {
+            return;
+        }
+        let inner = this.inner().project_ref();
 
-                let mut list = wait_list.lock_exclusive();
+        // Set up a guard that panics on drop, in order to cause an abort should
+        // `lock_exclusive` panic. This is necessary because we absolutely must remove the
+        // waiter from the linked list before returning here otherwise we can cause
+        // use-after-frees.
+        let abort_on_panic = PanicOnDrop;
 
-                let waiter = waiter.as_ref().get();
+        let mut list = inner.wait_list.lock_exclusive();
 
-                // Case 1: We were still waiting before we were cancelled; just remove ourselves
-                // from the list and do nothing more.
-                if let WaiterState::Waiting { .. } = unsafe { &(*waiter.get()).state } {
-                    // Dequeue ourselves so we can safely drop everything while no-one references
-                    // it.
-                    unsafe { list.inner_mut().dequeue(waiter) };
-                }
+        let waiter = inner.waiter.as_ref().get();
 
-                // Disarm the guard, we no longer need to abort on a panic.
-                mem::forget(abort_on_panic);
+        // If we were still waiting before we were cancelled, remove ourselves from the list.
+        // SAFETY: We hold an exclusive lock to the linked list.
+        if let WaiterState::Waiting { .. } = unsafe { &(*waiter.get()).state } {
+            unsafe { list.inner_mut().dequeue(waiter) };
+        }
 
-                // Case 2: We have been woken but were cancelled before our `poll` could handle
-                // the notification. Defer to the user-provided callback to decide what to do.
-                if let WaiterState::Woken { output } = unsafe { &mut (*waiter.get()).state } {
-                    let output = unsafe { ManuallyDrop::take(output) };
+        // Disarm the guard, we no longer need to abort on a panic.
+        mem::forget(abort_on_panic);
 
-                    let cancel_callback = match state.project_replace(WaitState::Done) {
-                        WaitStateProjectReplace::Waiting { on_cancel, .. } => on_cancel,
-                        WaitStateProjectReplace::Done => unreachable!(),
-                    };
-                    cancel_callback.on_cancel(list, output);
-                }
-            }
-            // No need to do anything if we didn't start to run or have completed.
-            WaitStateProject::Done => {}
+        // Call the `on_cancel` callback if necessary.
+        // SAFETY: We are no longer queued in the list, so we don't need to be `!Unpin` anymore.
+        let inner = unsafe { Pin::into_inner_unchecked(this.project()) };
+        let old_inner = inner.take().unwrap();
+        let waiter = old_inner.waiter.into_inner().into_inner();
+        if let WaiterState::Woken { output } = waiter.state {
+            old_inner.on_cancel.on_cancel(list, output);
         }
     }
 }
@@ -875,12 +849,12 @@ where
     <L as lock::Lifetime<'wait_list>>::ExclusiveGuard: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.inner.state {
-            WaitState::Waiting { wait_list, .. } => f
+        match &self.inner {
+            Some(inner) => f
                 .debug_struct("Wait::Waiting")
-                .field("wait_list", wait_list)
+                .field("wait_list", inner.wait_list)
                 .finish(),
-            WaitState::Done => f.pad("Wait::Done"),
+            None => f.pad("Wait::Done"),
         }
     }
 }

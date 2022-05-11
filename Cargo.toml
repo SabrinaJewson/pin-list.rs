@@ -19,7 +19,7 @@ loom_05 = ["loom_05_crate"]
 lock_api_04_crate = { package = "lock_api", version = "0.4.7", optional = true }
 loom_05_crate = { package = "loom", version = "0.5.4", optional = true }
 pin-project-lite = "0.2.9"
-pinned-aliasable = "0.1.2"
+pinned-aliasable = "0.1.3"
 
 [dev-dependencies]
 pin-utils = "0.1.0"
