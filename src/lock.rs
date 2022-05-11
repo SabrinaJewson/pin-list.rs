@@ -269,6 +269,47 @@ mod lock_api_04 {
     }
 }
 
+#[cfg(feature = "loom_05")]
+mod loom_05 {
+    use crate::lock;
+    use crate::lock::Lock;
+    use loom_05_crate::sync::Mutex;
+    use loom_05_crate::sync::MutexGuard;
+    use loom_05_crate::sync::RwLock;
+    use loom_05_crate::sync::RwLockReadGuard;
+    use loom_05_crate::sync::RwLockWriteGuard;
+
+    #[cfg_attr(doc_nightly, doc(cfg(feature = "loom")))]
+    impl<'this, T> lock::Lifetime<'this> for Mutex<T> {
+        type ExclusiveGuard = MutexGuard<'this, T>;
+        type SharedGuard = MutexGuard<'this, T>;
+    }
+    #[cfg_attr(doc_nightly, doc(cfg(feature = "loom")))]
+    unsafe impl<T> Lock for Mutex<T> {
+        fn lock_exclusive(&self) -> <Self as lock::Lifetime<'_>>::ExclusiveGuard {
+            self.lock().unwrap()
+        }
+        fn lock_shared(&self) -> <Self as lock::Lifetime<'_>>::SharedGuard {
+            self.lock_exclusive()
+        }
+    }
+
+    #[cfg_attr(doc_nightly, doc(cfg(feature = "loom")))]
+    impl<'this, T> lock::Lifetime<'this> for RwLock<T> {
+        type ExclusiveGuard = RwLockWriteGuard<'this, T>;
+        type SharedGuard = RwLockReadGuard<'this, T>;
+    }
+    #[cfg_attr(doc_nightly, doc(cfg(feature = "loom")))]
+    unsafe impl<T> Lock for RwLock<T> {
+        fn lock_exclusive(&self) -> <Self as lock::Lifetime<'_>>::ExclusiveGuard {
+            self.write().unwrap()
+        }
+        fn lock_shared(&self) -> <Self as lock::Lifetime<'_>>::SharedGuard {
+            self.read().unwrap()
+        }
+    }
+}
+
 mod bounds {
     #[allow(missing_debug_implementations)]
     pub struct Bounds<T>(T);

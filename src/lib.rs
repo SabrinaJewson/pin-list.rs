@@ -6,6 +6,7 @@
 //! - `std`: Implements the `Lock` traits on locks from the standard library.
 //! - `lock_api_04`: Implements the `Lock` traits on locks from [`lock_api`] v0.4. This enables
 //! integration of crates like [`parking_lot`], [`spin`] and [`usync`].
+//! - `loom_05`: Implements the `Lock` traits on locks from [`loom`] v0.5.
 //!
 //! # Example
 //!
@@ -127,6 +128,7 @@
 //! [`parking_lot`]: https://docs.rs/parking_lot
 //! [`spin`]: https://docs.rs/spin
 //! [`usync`]: https://docs.rs/usync
+//! [`loom`]: https://docs.rs/loom
 #![warn(
     clippy::pedantic,
     missing_debug_implementations,
@@ -154,6 +156,9 @@ extern crate std;
 
 #[cfg(feature = "lock_api_04")]
 pub extern crate lock_api_04_crate as lock_api_04;
+
+#[cfg(feature = "loom_05")]
+pub extern crate loom_05_crate as loom_05;
 
 use core::cell::UnsafeCell;
 use core::fmt;

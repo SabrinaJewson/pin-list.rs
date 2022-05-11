@@ -9,18 +9,20 @@ license = "MIT"
 keywords = ["WaitList", "Notify", "event-listener"]
 categories = ["asynchronous", "concurrency", "data-structures", "no-std"]
 
-[dependencies]
-lock_api_04_crate = { package = "lock_api", version = "0.4.7", optional = true }
-pinned-aliasable = "0.1.2"
-pin-project-lite = "0.2.9"
-
-[dev-dependencies]
-pin-utils = "0.1.0"
-
 [features]
 alloc = []
 std = ["alloc"]
 lock_api_04 = ["lock_api_04_crate"]
+loom_05 = ["loom_05_crate"]
+
+[dependencies]
+lock_api_04_crate = { package = "lock_api", version = "0.4.7", optional = true }
+loom_05_crate = { package = "loom", version = "0.5.4", optional = true }
+pin-project-lite = "0.2.9"
+pinned-aliasable = "0.1.2"
+
+[dev-dependencies]
+pin-utils = "0.1.0"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_nightly"]
