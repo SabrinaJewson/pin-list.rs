@@ -1,13 +1,13 @@
 [package]
 name = "wait-list"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.56.0"
-description = "The most fundamental primitive for async synchronization"
-repository = "https://github.com/SabrinaJewson/wait-list.rs"
+description = "Deprecated in favour of pin-list"
+repository = "https://github.com/SabrinaJewson/pin-list.rs"
 license = "MIT"
-keywords = ["WaitList", "Notify", "event-listener"]
-categories = ["asynchronous", "concurrency", "data-structures", "no-std"]
+keywords = []
+categories = []
 
 [features]
 alloc = []

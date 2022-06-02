@@ -1,5 +1,13 @@
 # wait-list
 
+This crate has been deprecated in favour of [`pin-list`](https://docs.rs/pin-list)!
+If you want to get the crate name for something else, please do not hesitate to [contact me] or
+email <help@crates.io>.
+
+[contact me]: https://sabrinajewson.org/
+
+Original readme below:
+
 This crate provides `WaitList`, the most fundamental type for async synchronization. `WaitList`
 is implemented as an intrusive linked list of futures.
 
