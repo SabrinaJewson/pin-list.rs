@@ -566,7 +566,6 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     /// # Panics
     ///
     /// Panics if the given list is a different one than this node was registered with.
-    #[must_use]
     pub fn reset(
         self: Pin<&'node mut Self>,
         list: &mut PinList<T>,
