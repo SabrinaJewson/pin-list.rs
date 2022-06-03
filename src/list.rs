@@ -180,7 +180,6 @@ where
 
 impl<T: ?Sized> PinList<T>
 where
-    // TODO: cargo doc check this
     <T as ConstFnBounds>::Type: Types,
 {
     /// Create a new empty `PinList` from a unique ID.
@@ -202,6 +201,9 @@ impl<T: ?Sized + Types> PinList<T> {
         self.head.is_none()
     }
 
+    /// # Safety
+    ///
+    /// The node must be present in the list.
     pub(crate) unsafe fn cursor(&self, current: Option<NonNull<NodeShared<T>>>) -> Cursor<'_, T> {
         Cursor {
             list: self,
@@ -209,6 +211,11 @@ impl<T: ?Sized + Types> PinList<T> {
         }
     }
 
+    /// # Safety
+    ///
+    /// - The node must be present in the list.
+    /// - This cursor must not be used to invalidate any other cursors in the list (by e.g.
+    /// removing nodes out from under them).
     pub(crate) unsafe fn cursor_mut(
         &mut self,
         current: Option<NonNull<NodeShared<T>>>,
@@ -222,6 +229,7 @@ impl<T: ?Sized + Types> PinList<T> {
     /// Obtain a `Cursor` pointing to the "ghost" element of the list.
     #[must_use]
     pub fn cursor_ghost(&self) -> Cursor<'_, T> {
+        // SAFETY: The ghost cursor is always in the list.
         unsafe { self.cursor(None) }
     }
 
@@ -246,6 +254,8 @@ impl<T: ?Sized + Types> PinList<T> {
     /// Obtain a `CursorMut` pointing to the "ghost" element of the list.
     #[must_use]
     pub fn cursor_ghost_mut(&mut self) -> CursorMut<'_, T> {
+        // SAFETY: The ghost cursor is always in the list, and the `&mut Self` ensures that safe
+        // code cannot currently hold a cursor.
         unsafe { self.cursor_mut(None) }
     }
 
@@ -332,9 +342,13 @@ unsafe impl<T: ?Sized + Types> Sync for Cursor<'_, T> where
 
 impl<'list, T: ?Sized + Types> Cursor<'list, T> {
     fn current_shared(&self) -> Option<&'list NodeShared<T>> {
+        // SAFETY: A cursor always points to a valid node in the list (ensured by
+        // `PinList::cursor`).
         self.current.map(|current| unsafe { current.as_ref() })
     }
     fn current_protected(&self) -> Option<&'list NodeProtected<T>> {
+        // SAFETY: Our shared reference to the list gives us shared access to the protected data of
+        // every node in it.
         Some(unsafe { &*self.current_shared()?.protected.get() })
     }
     fn current_linked(&self) -> Option<&'list NodeLinked<T>> {
@@ -431,13 +445,18 @@ unsafe impl<T: ?Sized + Types> Sync for CursorMut<'_, T> where
 
 impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     fn current_shared(&self) -> Option<&NodeShared<T>> {
-        // SAFETY: A cursor always points to a valid node in the list.
+        // SAFETY: A cursor always points to a valid node in the list (ensured by
+        // `PinList::cursor_mut`).
         self.current.map(|current| unsafe { current.as_ref() })
     }
     fn current_protected(&self) -> Option<&NodeProtected<T>> {
+        // SAFETY: Our shared reference to the list gives us shared access to the protected data of
+        // every node in it.
         Some(unsafe { &*self.current_shared()?.protected.get() })
     }
     fn current_protected_mut(&mut self) -> Option<&mut NodeProtected<T>> {
+        // SAFETY: Our unique reference to the list gives us unique access to the protected data of
+        // every node in it.
         Some(unsafe { &mut *self.current_shared()?.protected.get() })
     }
     fn current_linked(&self) -> Option<&NodeLinked<T>> {
@@ -641,7 +660,7 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
             NodeProtected::Removed(..) => unsafe { debug_unreachable!() },
         };
 
-        // Remove ourselves from the list
+        // Remove ourselves from the list.
         *unsafe { self.list.cursor_mut(old.prev) }.next_mut() = old.next;
         *unsafe { self.list.cursor_mut(old.next) }.prev_mut() = old.prev;
 
@@ -657,11 +676,11 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
             unsafe { ptr::write(protected, NodeProtected::Removed(removed)) };
         });
 
-        // Set the node's state to removed
+        // Calculate the new user data and set the state to to removed.
         let removed = NodeRemoved { data: f(old.data) };
         unsafe { ptr::write(protected, NodeProtected::Removed(removed)) };
 
-        // Disarm the guard.
+        // Disarm the guard now that `protected` holds a valid value again.
         mem::forget(guard);
 
         true

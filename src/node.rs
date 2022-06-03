@@ -1,4 +1,4 @@
-//! The `Node` type an its related APIs.
+//! The `Node` type and its related APIs.
 
 use crate::list::NodeLinked;
 use crate::list::NodeProtected;
@@ -71,7 +71,7 @@ pin_project! {
         // the inner state is valid.
         list_id: T::Id,
 
-        // State that is also accessible by a walker of the list.
+        // State that is also accessible by a walker of the list (cursors).
         #[pin]
         shared: Aliasable<NodeShared<T>>,
     }
@@ -169,6 +169,7 @@ impl<T: ?Sized + Types> Node<T> {
     ) -> Pin<&mut InitializedNode<'_, T>> {
         let prev = *cursor.prev_mut();
 
+        // Store our own state as linked.
         let node = self.init(NodeInner {
             list_id: cursor.list().id,
             shared: Aliasable::new(NodeShared {
@@ -181,6 +182,8 @@ impl<T: ?Sized + Types> Node<T> {
             }),
         });
 
+        // Update the previous node's `next` pointer and the next node's `prev` pointer to both
+        // point to us.
         *unsafe { cursor.list.cursor_mut(prev) }.next_mut() = Some(node.shared_ptr());
         *cursor.prev_mut() = Some(node.shared_ptr());
 
@@ -200,6 +203,7 @@ impl<T: ?Sized + Types> Node<T> {
     ) -> Pin<&mut InitializedNode<'_, T>> {
         let next = *cursor.next_mut();
 
+        // Store our own state as linked.
         let node = self.init(NodeInner {
             list_id: cursor.list().id,
             shared: Aliasable::new(NodeShared {
@@ -212,6 +216,8 @@ impl<T: ?Sized + Types> Node<T> {
             }),
         });
 
+        // Update the previous node's `next` pointer and the next node's `prev` pointer to both
+        // point to us.
         *cursor.next_mut() = Some(node.shared_ptr());
         *unsafe { cursor.list.cursor_mut(next) }.prev_mut() = Some(node.shared_ptr());
 
@@ -294,6 +300,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
 
     fn new_mut(node: Pin<&'node mut Node<T>>) -> Option<Pin<&'node mut Self>> {
         node.inner.as_ref()?;
+        // SAFETY: We have just asserted that `inner` is `Some`.
         Some(unsafe { Self::new_mut_unchecked(node) })
     }
 
@@ -366,6 +373,8 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         // that a `&NodeRemoved` existed at the time of calling this function.
         match unsafe { &*self.shared().protected.get() } {
             NodeProtected::Linked(..) => {
+                // SAFETY: We have unique access to the list, and we have asserted that the node
+                // isn't removed.
                 Some(match unsafe { &mut *self.shared().protected.get() } {
                     NodeProtected::Linked(linked) => &mut linked.data,
                     NodeProtected::Removed(..) => unsafe { debug_unreachable!() },
@@ -565,6 +574,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         match self.unlink(list) {
             Ok((protected, unprotected)) => (NodeData::Linked(protected), unprotected),
             Err(this) => {
+                // SAFETY: `unlink` only returns `Err` if we have been removed.
                 let (removed, unprotected) = unsafe { this.take_removed_unchecked() };
                 (NodeData::Removed(removed), unprotected)
             }
