@@ -43,6 +43,7 @@ where
 // SAFETY: `Unique<I>` functions as a `SyncWrapper`
 unsafe impl<I: Id> Sync for Unique<I> {}
 
+#[cfg(target_has_atomic = "64")]
 mod checked {
     use super::Id;
     use super::Unique;
@@ -51,6 +52,8 @@ mod checked {
     use core::sync::atomic::AtomicU64;
 
     /// An allocator of IDs that uses a global atomic `u64` counter.
+    ///
+    /// This type is only available on platforms with 64-bit atomics.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Checked(NonZeroU64);
 
@@ -82,6 +85,7 @@ mod checked {
     // SAFETY: `new` can never return two `u64`s with the same value.
     unsafe impl Id for Checked {}
 }
+#[cfg(target_has_atomic = "64")]
 pub use checked::Checked;
 
 mod unchecked {
@@ -113,6 +117,7 @@ mod unchecked {
 }
 pub use unchecked::Unchecked;
 
+#[cfg(target_has_atomic = "64")]
 mod debug_checked {
     use super::Id;
     use super::Unique;
@@ -120,6 +125,8 @@ mod debug_checked {
 
     /// Equivalent to [`id::Checked`] when `debug_assertions` are enabled, but equivalent to
     /// [`id::Unchecked`] in release.
+    ///
+    /// This type is only available on platforms with 64-bit atomics.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DebugChecked {
         #[cfg(debug_assertions)]
@@ -151,6 +158,7 @@ mod debug_checked {
     // SAFETY: Ensured by caller in `DebugChecked::new`
     unsafe impl Id for DebugChecked {}
 }
+#[cfg(target_has_atomic = "64")]
 pub use debug_checked::DebugChecked;
 
 mod lifetime {
