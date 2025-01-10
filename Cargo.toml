@@ -2,7 +2,7 @@
 name = "pin-list"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.56.0"
+rust-version = "1.60.0"
 description = "A safe `Pin`-based intrusive doubly linked list"
 repository = "https://github.com/SabrinaJewson/pin-list.rs"
 license = "MIT"
