@@ -215,7 +215,7 @@ impl<T: ?Sized + Types> PinList<T> {
     ///
     /// - The node must be present in the list.
     /// - This cursor must not be used to invalidate any other cursors in the list (by e.g.
-    /// removing nodes out from under them).
+    ///   removing nodes out from under them).
     pub(crate) unsafe fn cursor_mut(
         &mut self,
         current: Option<NonNull<NodeShared<T>>>,
@@ -308,6 +308,7 @@ impl<T: ?Sized + Types> PinList<T> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<T: ?Sized + Types> Debug for PinList<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PinList").field("id", &self.id).finish()

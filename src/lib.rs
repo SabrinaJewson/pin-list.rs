@@ -175,9 +175,6 @@
 
     // I export all the types at the crate root, so this lint is pointless.
     clippy::module_name_repetitions,
-
-    // `ǃ` (latin letter retroflex click) is used in the tests for a never type
-    uncommon_codepoints,
 )]
 #![no_std]
 
@@ -207,10 +204,6 @@ mod tests {
     use std::panic;
     use std::process::abort;
     use std::ptr;
-
-    // Never type, but it's actually latin letter retroflex click
-    #[derive(Debug, PartialEq)]
-    enum ǃ {}
 
     type PinListTypes = dyn crate::Types<
         Id = id::Checked,
@@ -496,31 +489,31 @@ mod tests {
         }
 
         // node before; node after; unlink
-        unlink(&mut list, &mut *nodes, 6);
+        unlink(&mut list, &mut nodes, 6);
         assert_order(&mut list, [2, 5, 1, 0, 3, 4]);
 
         // node before; node after; remove
-        remove(&mut list, &mut *nodes, 5);
+        remove(&mut list, &mut nodes, 5);
         assert_order(&mut list, [2, 1, 0, 3, 4]);
 
         // node before; ghost after; unlink
-        unlink(&mut list, &mut *nodes, 4);
+        unlink(&mut list, &mut nodes, 4);
         assert_order(&mut list, [2, 1, 0, 3]);
 
         // node before; ghost after; remove
-        remove(&mut list, &mut *nodes, 3);
+        remove(&mut list, &mut nodes, 3);
         assert_order(&mut list, [2, 1, 0]);
 
         // ghost before; node after; unlink
-        unlink(&mut list, &mut *nodes, 2);
+        unlink(&mut list, &mut nodes, 2);
         assert_order(&mut list, [1, 0]);
 
         // ghost before; node after; remove
-        remove(&mut list, &mut *nodes, 1);
+        remove(&mut list, &mut nodes, 1);
         assert_order(&mut list, [0]);
 
         // ghost before; ghost after; unlink
-        unlink(&mut list, &mut *nodes, 0);
+        unlink(&mut list, &mut nodes, 0);
         assert_order(&mut list, []);
     }
 }

@@ -39,8 +39,9 @@ pin_project! {
     ///     The node has been removed from a [`PinList`]. It holds a `Removed` and an
     ///     `Unprotected`. Similar to the "linked" state, proof of access to the [`PinList`] is
     ///     required for most operations. Dropping a node in this state will abort.
-    pub struct Node<T: ?Sized>
+    pub struct Node<T>
     where
+        T: ?Sized,
         T: Types,
     {
         // `None` if initial, `Some` if initialized
@@ -48,8 +49,9 @@ pin_project! {
         inner: Option<NodeInner<T>>,
     }
 
-    impl<T: ?Sized> PinnedDrop for Node<T>
+    impl<T> PinnedDrop for Node<T>
     where
+        T: ?Sized,
         T: Types,
     {
         fn drop(this: Pin<&mut Self>) {
@@ -63,8 +65,9 @@ pin_project! {
 }
 
 pin_project! {
-    struct NodeInner<T: ?Sized>
+    struct NodeInner<T>
     where
+        T: ?Sized,
         T: Types,
     {
         // The ID of the list this node is/was registered in, used for checking whether access to
@@ -146,6 +149,12 @@ where
     #[must_use]
     pub const fn new() -> Self {
         Self { inner: None }
+    }
+}
+
+impl<T: ?Sized + Types> Default for Node<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -542,7 +551,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         // pinned.
         let this = unsafe { &mut Pin::into_inner_unchecked(self).node };
 
-        let old_node = mem::replace(&mut this.inner, None);
+        let old_node = this.inner.take();
         // SAFETY: In order for this type to exist, the node must be initialized.
         let old_inner = unsafe { unwrap_unchecked(old_node) };
         let old_shared = old_inner.shared.into_inner();
