@@ -4,6 +4,7 @@ use crate::list::NodeLinked;
 use crate::list::NodeProtected;
 use crate::list::NodeRemoved;
 use crate::list::NodeShared;
+use crate::list::OptionNodeShared;
 use crate::util::abort;
 use crate::util::debug_unreachable;
 use crate::util::unwrap_unchecked;
@@ -193,8 +194,9 @@ impl<T: ?Sized + Types> Node<T> {
 
         // Update the previous node's `next` pointer and the next node's `prev` pointer to both
         // point to us.
-        *unsafe { cursor.list.cursor_mut(prev) }.next_mut() = Some(node.shared_ptr());
-        *cursor.prev_mut() = Some(node.shared_ptr());
+        *unsafe { cursor.list.cursor_mut(prev) }.next_mut() =
+            OptionNodeShared::some(node.shared_ptr());
+        *cursor.prev_mut() = OptionNodeShared::some(node.shared_ptr());
 
         node
     }
@@ -227,8 +229,9 @@ impl<T: ?Sized + Types> Node<T> {
 
         // Update the previous node's `next` pointer and the next node's `prev` pointer to both
         // point to us.
-        *cursor.next_mut() = Some(node.shared_ptr());
-        *unsafe { cursor.list.cursor_mut(next) }.prev_mut() = Some(node.shared_ptr());
+        *cursor.next_mut() = OptionNodeShared::some(node.shared_ptr());
+        *unsafe { cursor.list.cursor_mut(next) }.prev_mut() =
+            OptionNodeShared::some(node.shared_ptr());
 
         node
     }
@@ -411,7 +414,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         }
 
         // SAFETY: We have shared access to the list, and this node is not removed from the list.
-        Some(unsafe { list.cursor(Some(self.shared_ptr())) })
+        Some(unsafe { list.cursor(OptionNodeShared::some(self.shared_ptr())) })
     }
 
     /// Obtain a unique cursor pointing to this node.
@@ -435,7 +438,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
 
         // SAFETY: We have exclusive access to the list, and this node is not removed from the
         // list.
-        Some(unsafe { list.cursor_mut(Some(self.shared_ptr())) })
+        Some(unsafe { list.cursor_mut(OptionNodeShared::some(self.shared_ptr())) })
     }
 
     /// Remove this node from its containing list and take its data, leaving the node in its

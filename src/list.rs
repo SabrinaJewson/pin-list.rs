@@ -13,6 +13,7 @@ use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Formatter;
 use core::mem;
+use core::mem::transmute;
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
@@ -76,13 +77,48 @@ pub struct PinList<T: ?Sized + Types> {
     /// The head of the list.
     ///
     /// If this is `None`, the list is empty.
-    head: Option<NonNull<NodeShared<T>>>,
+    head: OptionNodeShared<T>,
 
     /// The tail of the list.
     ///
     /// Whether this is `None` must remain in sync with whether `head` is `None`.
-    tail: Option<NonNull<NodeShared<T>>>,
+    tail: OptionNodeShared<T>,
 }
+
+/// An optional pointer to a `NodeShared`.
+///
+/// Unlike `Option<NonNull<NodeShared<T>>>`, this has a niche.
+pub(crate) struct OptionNodeShared<T: ?Sized + Types>(NonNull<NodeShared<T>>);
+
+impl<T: ?Sized + Types> OptionNodeShared<T> {
+    pub(crate) const NONE: Self = Self(Self::SENTINEL);
+    pub(crate) fn some(ptr: NonNull<NodeShared<T>>) -> Self {
+        Self(ptr)
+    }
+    pub(crate) fn get(self) -> Option<NonNull<NodeShared<T>>> {
+        (self.0 != Self::SENTINEL).then(|| self.0)
+    }
+    const SENTINEL: NonNull<NodeShared<T>> = {
+        // `NodeShared` indirectly contains pointers, so we know this is true.
+        assert!(2 <= align_of::<NodeShared<T>>());
+
+        // We use a value of 1 as the sentinel since it isn’t aligned
+        // and thus can’t be mistaken for a valid value.
+        //
+        // We use a transmute to explicitly polyfill `ptr::without_provenance`.
+        #[allow(clippy::useless_transmute)]
+        unsafe {
+            NonNull::new_unchecked(transmute::<usize, *mut NodeShared<T>>(1))
+        }
+    };
+}
+
+impl<T: ?Sized + Types> Clone for OptionNodeShared<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: ?Sized + Types> Copy for OptionNodeShared<T> {}
 
 /// The state of a node in a list shared between the node's owner and other types.
 ///
@@ -106,10 +142,10 @@ pub(crate) enum NodeProtected<T: ?Sized + Types> {
 
 pub(crate) struct NodeLinked<T: ?Sized + Types> {
     /// The previous node in the linked list.
-    pub(crate) prev: Option<NonNull<NodeShared<T>>>,
+    pub(crate) prev: OptionNodeShared<T>,
 
     /// The next node in the linked list.
-    pub(crate) next: Option<NonNull<NodeShared<T>>>,
+    pub(crate) next: OptionNodeShared<T>,
 
     /// Any extra data the user wants to store in this state.
     pub(crate) data: T::Protected,
@@ -187,8 +223,8 @@ where
     pub const fn new(id: id::Unique<<<T as ConstFnBounds>::Type as Types>::Id>) -> Self {
         Self {
             id: id.into_inner(),
-            head: None,
-            tail: None,
+            head: OptionNodeShared::NONE,
+            tail: OptionNodeShared::NONE,
         }
     }
 }
@@ -197,14 +233,14 @@ impl<T: ?Sized + Types> PinList<T> {
     /// Check whether there are any nodes in this list.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        debug_assert_eq!(self.head.is_some(), self.tail.is_some());
-        self.head.is_none()
+        debug_assert_eq!(self.head.get().is_some(), self.tail.get().is_some());
+        self.head.get().is_none()
     }
 
     /// # Safety
     ///
     /// The node must be present in the list.
-    pub(crate) unsafe fn cursor(&self, current: Option<NonNull<NodeShared<T>>>) -> Cursor<'_, T> {
+    pub(crate) unsafe fn cursor(&self, current: OptionNodeShared<T>) -> Cursor<'_, T> {
         Cursor {
             list: self,
             current,
@@ -216,10 +252,7 @@ impl<T: ?Sized + Types> PinList<T> {
     /// - The node must be present in the list.
     /// - This cursor must not be used to invalidate any other cursors in the list (by e.g.
     ///   removing nodes out from under them).
-    pub(crate) unsafe fn cursor_mut(
-        &mut self,
-        current: Option<NonNull<NodeShared<T>>>,
-    ) -> CursorMut<'_, T> {
+    pub(crate) unsafe fn cursor_mut(&mut self, current: OptionNodeShared<T>) -> CursorMut<'_, T> {
         CursorMut {
             list: self,
             current,
@@ -230,7 +263,7 @@ impl<T: ?Sized + Types> PinList<T> {
     #[must_use]
     pub fn cursor_ghost(&self) -> Cursor<'_, T> {
         // SAFETY: The ghost cursor is always in the list.
-        unsafe { self.cursor(None) }
+        unsafe { self.cursor(OptionNodeShared::NONE) }
     }
 
     /// Obtain a `Cursor` pointing to the first element of the list, or the ghost element if the
@@ -256,7 +289,7 @@ impl<T: ?Sized + Types> PinList<T> {
     pub fn cursor_ghost_mut(&mut self) -> CursorMut<'_, T> {
         // SAFETY: The ghost cursor is always in the list, and the `&mut Self` ensures that safe
         // code cannot currently hold a cursor.
-        unsafe { self.cursor_mut(None) }
+        unsafe { self.cursor_mut(OptionNodeShared::NONE) }
     }
 
     /// Obtain a `CursorMut` pointing to the first element of the list, or the ghost element if the
@@ -326,7 +359,7 @@ impl<T: ?Sized + Types> Debug for PinList<T> {
 /// bitwise copy — very cheap.
 pub struct Cursor<'list, T: ?Sized + Types> {
     list: &'list PinList<T>,
-    current: Option<NonNull<NodeShared<T>>>,
+    current: OptionNodeShared<T>,
 }
 
 unsafe impl<T: ?Sized + Types> Send for Cursor<'_, T> where
@@ -345,7 +378,9 @@ impl<'list, T: ?Sized + Types> Cursor<'list, T> {
     fn current_shared(&self) -> Option<&'list NodeShared<T>> {
         // SAFETY: A cursor always points to a valid node in the list (ensured by
         // `PinList::cursor`).
-        self.current.map(|current| unsafe { current.as_ref() })
+        self.current
+            .get()
+            .map(|current| unsafe { current.as_ref() })
     }
     fn current_protected(&self) -> Option<&'list NodeProtected<T>> {
         // SAFETY: Our shared reference to the list gives us shared access to the protected data of
@@ -429,7 +464,7 @@ where
 /// between the start and end of the list, in which case it is called the ghost cursor.
 pub struct CursorMut<'list, T: ?Sized + Types> {
     pub(crate) list: &'list mut PinList<T>,
-    pub(crate) current: Option<NonNull<NodeShared<T>>>,
+    pub(crate) current: OptionNodeShared<T>,
 }
 
 unsafe impl<T: ?Sized + Types> Send for CursorMut<'_, T> where
@@ -448,7 +483,9 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
     fn current_shared(&self) -> Option<&NodeShared<T>> {
         // SAFETY: A cursor always points to a valid node in the list (ensured by
         // `PinList::cursor_mut`).
-        self.current.map(|current| unsafe { current.as_ref() })
+        self.current
+            .get()
+            .map(|current| unsafe { current.as_ref() })
     }
     fn current_protected(&self) -> Option<&NodeProtected<T>> {
         // SAFETY: Our shared reference to the list gives us shared access to the protected data of
@@ -472,15 +509,15 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
             NodeProtected::Removed(..) => unsafe { debug_unreachable!() },
         }
     }
-    pub(crate) fn prev_mut(&mut self) -> &mut Option<NonNull<NodeShared<T>>> {
-        match self.current {
+    pub(crate) fn prev_mut(&mut self) -> &mut OptionNodeShared<T> {
+        match self.current.get() {
             // Unwrap because we don't have polonius
             Some(_) => &mut self.current_linked_mut().unwrap().prev,
             None => &mut self.list.tail,
         }
     }
-    pub(crate) fn next_mut(&mut self) -> &mut Option<NonNull<NodeShared<T>>> {
-        match self.current {
+    pub(crate) fn next_mut(&mut self) -> &mut OptionNodeShared<T> {
+        match self.current.get() {
             // Unwrap because we don't have polonius
             Some(_) => &mut self.current_linked_mut().unwrap().next,
             None => &mut self.list.head,
