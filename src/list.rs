@@ -13,6 +13,7 @@ use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Formatter;
 use core::mem;
+use core::mem::align_of;
 use core::mem::transmute;
 use core::pin::Pin;
 use core::ptr;
